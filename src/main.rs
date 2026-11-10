@@ -27,6 +27,10 @@ const CURSOR_REFERENCE_CELL_SIZE: u32 = 32;
 const MAX_CURSOR_STEP: u32 = 8;
 /// Сколько тиков живет клетка, после чего умирает.
 const CREATURE_LIFETIME_TICKS: usize = 1000;
+/// Максимальная скорость: столько тиков за кадр.
+const MAX_SPEED: u32 = u32::MAX;
+/// Максимальное замедление: один тик раз в столько кадров.
+const MAX_FRAMES_PER_TICK: u32 = 64;
 
 fn main() {
     let mut jar = Jar::new(10);
@@ -60,6 +64,45 @@ fn main() {
     }
 }
 
+/// Скорость симуляции: либо несколько тиков за кадр, либо один тик раз в несколько кадров.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Speed {
+    /// Столько тиков выполнять за один кадр.
+    TicksPerFrame(u32),
+    /// Один тик выполнять раз в столько кадров.
+    FramesPerTick(u32),
+}
+
+impl Speed {
+    /// Следующая, более высокая скорость.
+    fn faster(self) -> Self {
+        match self {
+            Self::TicksPerFrame(n) => Self::TicksPerFrame(if n >= MAX_SPEED { n } else { n + 1 }),
+            Self::FramesPerTick(2) => Self::TicksPerFrame(1),
+            Self::FramesPerTick(n) => Self::FramesPerTick(n - 1),
+        }
+    }
+
+    /// Следующая, более низкая скорость.
+    fn slower(self) -> Self {
+        match self {
+            Self::TicksPerFrame(1) => Self::FramesPerTick(2),
+            Self::TicksPerFrame(n) => Self::TicksPerFrame(n - 1),
+            Self::FramesPerTick(n) => {
+                Self::FramesPerTick(n.saturating_add(1).min(MAX_FRAMES_PER_TICK))
+            }
+        }
+    }
+
+    /// Подпись скорости для заголовка окна.
+    fn label(self) -> String {
+        match self {
+            Self::TicksPerFrame(n) => format!("x{n}"),
+            Self::FramesPerTick(n) => format!("x1/{n}"),
+        }
+    }
+}
+
 /// Приложение winit: хранит Jar, раз в кадр обновляет снапшот и рисует его.
 struct App {
     jar: Jar,
@@ -74,6 +117,12 @@ struct App {
     /// Позиция выбранной клетки.
     cursor_x: usize,
     cursor_y: usize,
+    /// Скорость симуляции.
+    speed: Speed,
+    /// Сколько кадров накоплено при замедленном режиме.
+    frame_accum: u32,
+    /// Приостановлена ли симуляция.
+    paused: bool,
     next_frame: Instant,
 }
 
@@ -91,6 +140,9 @@ impl App {
             cell_size: 16,
             cursor_x,
             cursor_y,
+            speed: Speed::TicksPerFrame(1),
+            frame_accum: 0,
+            paused: false,
             next_frame: Instant::now(),
         }
     }
@@ -99,6 +151,51 @@ impl App {
         if let Some(window) = &self.window {
             window.request_redraw();
         }
+    }
+
+    /// Обновляет заголовок окна: тик, масштаб, скорость и состояние паузы.
+    fn update_title(&self) {
+        let Some(window) = &self.window else {
+            return;
+        };
+
+        let pause = if self.paused { ", пауза" } else { "" };
+        window.set_title(&format!(
+            "Cells — тик {}, масштаб {}, скорость {}{}",
+            self.snapshot.tick,
+            self.cell_size,
+            self.speed.label(),
+            pause
+        ));
+    }
+
+    /// Меняет скорость симуляции: delta > 0 — быстрее, delta < 0 — медленнее.
+    fn change_speed(&mut self, delta: i32) {
+        let new_speed = if delta > 0 {
+            self.speed.faster()
+        } else if delta < 0 {
+            self.speed.slower()
+        } else {
+            self.speed
+        };
+
+        if new_speed != self.speed {
+            self.speed = new_speed;
+            self.frame_accum = 0;
+            self.update_title();
+        }
+    }
+
+    /// Ставит симуляцию на паузу или снимает ее.
+    fn toggle_pause(&mut self) {
+        self.paused = !self.paused;
+
+        if !self.paused {
+            // Возобновляем симуляцию сразу, не дожидаясь следующего кадра.
+            self.next_frame = Instant::now();
+        }
+
+        self.update_title();
     }
 
     fn zoom(&mut self, direction: i32) {
@@ -160,10 +257,7 @@ impl App {
             eprintln!("Не удалось показать кадр: {err}");
         }
 
-        window.set_title(&format!(
-            "Cells — тик {}, масштаб {}",
-            self.snapshot.tick, self.cell_size
-        ));
+        self.update_title();
     }
 }
 
@@ -228,16 +322,27 @@ impl ApplicationHandler for App {
             WindowEvent::RedrawRequested => self.render(),
             WindowEvent::KeyboardInput { event, .. } => {
                 if event.state == ElementState::Pressed {
-                    let direction = match event.physical_key {
-                        PhysicalKey::Code(KeyCode::KeyW | KeyCode::ArrowUp) => Some((0, -1)),
-                        PhysicalKey::Code(KeyCode::KeyS | KeyCode::ArrowDown) => Some((0, 1)),
-                        PhysicalKey::Code(KeyCode::KeyA | KeyCode::ArrowLeft) => Some((-1, 0)),
-                        PhysicalKey::Code(KeyCode::KeyD | KeyCode::ArrowRight) => Some((1, 0)),
-                        _ => None,
-                    };
-
-                    if let Some((dx, dy)) = direction {
-                        self.move_cursor(dx, dy);
+                    match event.physical_key {
+                        PhysicalKey::Code(KeyCode::KeyW | KeyCode::ArrowUp) => {
+                            self.move_cursor(0, -1)
+                        }
+                        PhysicalKey::Code(KeyCode::KeyS | KeyCode::ArrowDown) => {
+                            self.move_cursor(0, 1)
+                        }
+                        PhysicalKey::Code(KeyCode::KeyA | KeyCode::ArrowLeft) => {
+                            self.move_cursor(-1, 0)
+                        }
+                        PhysicalKey::Code(KeyCode::KeyD | KeyCode::ArrowRight) => {
+                            self.move_cursor(1, 0)
+                        }
+                        PhysicalKey::Code(KeyCode::Space) => self.toggle_pause(),
+                        PhysicalKey::Code(KeyCode::Equal | KeyCode::NumpadAdd) => {
+                            self.change_speed(1)
+                        }
+                        PhysicalKey::Code(KeyCode::Minus | KeyCode::NumpadSubtract) => {
+                            self.change_speed(-1)
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -258,12 +363,37 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if self.paused {
+            event_loop.set_control_flow(ControlFlow::Wait);
+            return;
+        }
+
         let now = Instant::now();
 
         if now >= self.next_frame {
-            self.jar.simulation_step();
-            self.snapshot = self.jar.snapshot();
-            self.request_redraw();
+            let stepped = match self.speed {
+                Speed::TicksPerFrame(n) => {
+                    for _ in 0..n {
+                        self.jar.simulation_step();
+                    }
+                    true
+                }
+                Speed::FramesPerTick(n) => {
+                    self.frame_accum += 1;
+                    if self.frame_accum >= n {
+                        self.frame_accum = 0;
+                        self.jar.simulation_step();
+                        true
+                    } else {
+                        false
+                    }
+                }
+            };
+
+            if stepped {
+                self.snapshot = self.jar.snapshot();
+                self.request_redraw();
+            }
             self.next_frame = now + FRAME_TIME;
         }
 
