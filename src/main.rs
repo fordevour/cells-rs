@@ -25,6 +25,8 @@ const CELL_BORDER_THICKNESS: u32 = 1;
 const CURSOR_REFERENCE_CELL_SIZE: u32 = 32;
 /// Максимальный шаг курсора в клетках при сильном отдалении.
 const MAX_CURSOR_STEP: u32 = 8;
+/// Сколько тиков живет клетка, после чего умирает.
+const CREATURE_LIFETIME_TICKS: usize = 1000;
 
 fn main() {
     let mut jar = Jar::new(10);
@@ -39,6 +41,7 @@ fn main() {
         },
         energy: 0,
         minerals: 0,
+        age: 0,
     };
     jar.creatures[5 + (5 * 10)] = Some(c0);
 
@@ -507,6 +510,16 @@ impl Jar {
         for i in 0..(self.size * self.size) {
             if let Some(mut creature) = self.creatures[i].clone() {
                 // Если в клетке есть существо, берем его копию
+                creature.age += 1;
+
+                if creature.age >= CREATURE_LIFETIME_TICKS {
+                    // Клетка прожила свой срок - умирает, а все ее минералы
+                    // возвращаются обратно на карту
+                    self.minerals[i] += creature.minerals;
+                    self.creatures[i] = None;
+                    continue;
+                }
+
                 match creature.genome.get_action() {
                     CreatureAction::Split => {
                         // Для деления нужно минимум 100 энергии и минимум 10 минералов
@@ -584,13 +597,15 @@ pub struct Creature {
 
     pub energy: usize,
     pub minerals: usize,
+    /// Возраст клетки в тиках.
+    pub age: usize,
 }
 impl Creature {
     /// Делит клетку на две.
     ///
     /// Каждая дочерняя клетка получает по 40% изначальной энергии, остаток теряется
     /// на само деление. Минералы делятся поровну без потерь: неделимый остаток
-    /// достается материнской клетке.
+    /// достается материнской клетке. Обе дочерние клетки рождаются с нулевым возрастом.
     pub fn split(&self) -> (Self, Self) {
         let energy = self.energy;
         let minerals = self.minerals;
@@ -605,11 +620,13 @@ impl Creature {
             genome: self.genome.clone(),
             energy: e_0,
             minerals: m_0,
+            age: 0,
         };
         let mut c_1 = Creature {
             genome: self.genome.clone(),
             energy: e_1,
             minerals: m_1,
+            age: 0,
         };
 
         c_0.genome.line_pointer = 0;
