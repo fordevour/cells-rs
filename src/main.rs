@@ -1,6 +1,6 @@
 use std::num::NonZeroU32;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use softbuffer::{Context, Surface};
 use winit::application::ApplicationHandler;
@@ -31,10 +31,72 @@ const CREATURE_LIFETIME_TICKS: usize = 1000;
 const MAX_PHOTOSYNTHESIS_ENERGY: usize = 4;
 /// Сколько энергии тратит поедание одного минерала.
 const EAT_MINERALS_ENERGY_COST: usize = 1;
+/// Шанс мутации генома при делении, в процентах (для каждой дочерней клетки).
+const MUTATION_CHANCE_PERCENT: u64 = 5;
 /// Максимальная скорость: столько тиков за кадр.
 const MAX_SPEED: u32 = u32::MAX;
 /// Максимальное замедление: один тик раз в столько кадров.
 const MAX_FRAMES_PER_TICK: u32 = 64;
+
+/// Простой генератор псевдослучайных чисел (xorshift64*).
+pub struct Rng(u64);
+
+impl Rng {
+    /// Создает генератор с заданным зерном. Нулевое зерно заменяется на ненулевое.
+    pub fn new(seed: u64) -> Self {
+        Self(if seed == 0 {
+            0x9E37_79B9_7F4A_7C15
+        } else {
+            seed
+        })
+    }
+
+    /// Создает генератор, засеянный текущим временем.
+    pub fn from_time() -> Self {
+        let seed = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos() as u64)
+            .unwrap_or(0x9E37_79B9_7F4A_7C15);
+        Self::new(seed)
+    }
+
+    /// Следующее псевдослучайное число.
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.0 = x;
+        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+
+    /// Случайное число в диапазоне `0..upper`.
+    fn below(&mut self, upper: usize) -> usize {
+        debug_assert!(upper > 0);
+        (self.next_u64() % upper as u64) as usize
+    }
+
+    /// Возвращает `true` с вероятностью `percent` процентов.
+    fn chance_percent(&mut self, percent: u64) -> bool {
+        self.next_u64() % 100 < percent
+    }
+}
+
+/// Случайный ген для вставки или замены.
+fn random_action(rng: &mut Rng) -> CreatureAction {
+    match rng.below(4) {
+        0 => CreatureAction::PhotoGrow,
+        1 => CreatureAction::EatMinerals,
+        2 => CreatureAction::Split,
+        _ => CreatureAction::Jump(random_jump_delta(rng)),
+    }
+}
+
+/// Случайное ненулевое значение для гена Jump.
+fn random_jump_delta(rng: &mut Rng) -> isize {
+    let delta = rng.below(8) as isize - 4;
+    if delta >= 0 { delta + 1 } else { delta }
+}
 
 fn main() {
     let jar = seeded_jar();
@@ -930,6 +992,8 @@ pub struct Jar {
     pub creatures: Vec<Option<Creature>>,
     /// Слой минералов
     pub minerals: Vec<usize>,
+    /// Генератор случайности для мутаций и выбора направления деления.
+    pub rng: Rng,
 }
 impl Jar {
     /// Jar квадратная
@@ -942,6 +1006,7 @@ impl Jar {
             tick: 0,
             creatures,
             minerals,
+            rng: Rng::from_time(),
         }
     }
 
@@ -1012,7 +1077,7 @@ impl Jar {
                                 self.creatures[i] = None;
                             } else {
                                 // Есть куда положить дочернюю клетку
-                                let (new_0, new_1) = creature.split();
+                                let (new_0, new_1) = creature.split(&mut self.rng);
                                 let j = nears[self.tick % nears.len()]; // Выбор места дочерней клетки
                                 self.creatures[i] = Some(new_0); // На месте материнской клетки
                                 self.creatures[j] = Some(new_1);
@@ -1077,7 +1142,9 @@ impl Creature {
     /// Каждая дочерняя клетка получает по 40% изначальной энергии, остаток теряется
     /// на само деление. Минералы делятся поровну без потерь: неделимый остаток
     /// достается материнской клетке. Обе дочерние клетки рождаются с нулевым возрастом.
-    pub fn split(&self) -> (Self, Self) {
+    ///
+    /// Каждая дочерняя клетка независимо может получить мутацию генома.
+    pub fn split(&self, rng: &mut Rng) -> (Self, Self) {
         let energy = self.energy;
         let minerals = self.minerals;
 
@@ -1103,11 +1170,18 @@ impl Creature {
         c_0.genome.line_pointer = 0;
         c_1.genome.line_pointer = 0;
 
+        if rng.chance_percent(MUTATION_CHANCE_PERCENT) {
+            c_0.genome.mutate(rng);
+        }
+        if rng.chance_percent(MUTATION_CHANCE_PERCENT) {
+            c_1.genome.mutate(rng);
+        }
+
         (c_0, c_1)
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CreatureAction {
     Split,
     PhotoGrow,
@@ -1146,6 +1220,68 @@ impl CreatureGenome {
             line,
             line_pointer: 0,
         }
+    }
+
+    /// Мутирует геном одним случайным способом:
+    /// вставка гена, удаление гена, замена гена или изменение значения Jump.
+    pub fn mutate(&mut self, rng: &mut Rng) {
+        if self.line.is_empty() {
+            self.line.push(random_action(rng));
+            return;
+        }
+
+        match rng.below(4) {
+            0 => {
+                // Вставка нового гена в случайную позицию.
+                let index = rng.below(self.line.len() + 1);
+                self.line.insert(index, random_action(rng));
+            }
+            1 => {
+                // Изменение значения Jump; если Jump нет — обычная замена гена.
+                if !self.mutate_jump_value(rng) {
+                    self.replace_gene(rng);
+                }
+            }
+            2 => {
+                // Удаление гена, но геном никогда не остается пустым.
+                if self.line.len() > 1 {
+                    let index = rng.below(self.line.len());
+                    self.line.remove(index);
+                } else {
+                    self.replace_gene(rng);
+                }
+            }
+            _ => self.replace_gene(rng),
+        }
+    }
+
+    /// Заменяет случайный ген на случайный другой.
+    fn replace_gene(&mut self, rng: &mut Rng) {
+        let index = rng.below(self.line.len());
+        self.line[index] = random_action(rng);
+    }
+
+    /// Изменяет значение случайного гена Jump. Возвращает `false`, если Jump нет.
+    fn mutate_jump_value(&mut self, rng: &mut Rng) -> bool {
+        let jump_positions: Vec<usize> = self
+            .line
+            .iter()
+            .enumerate()
+            .filter_map(|(index, action)| {
+                matches!(action, CreatureAction::Jump(_)).then_some(index)
+            })
+            .collect();
+
+        if jump_positions.is_empty() {
+            return false;
+        }
+
+        let index = jump_positions[rng.below(jump_positions.len())];
+        if let CreatureAction::Jump(value) = &mut self.line[index] {
+            *value += random_jump_delta(rng);
+        }
+
+        true
     }
 
     /// Выдает текущее действие клетки, сдвигает указатель действия на следующий
@@ -1222,6 +1358,7 @@ mod tests {
     #[test]
     fn initial_population_survives_and_grows() {
         let mut jar = seeded_jar();
+        jar.rng = Rng::new(0xC0FFEE);
         let initial = jar.creatures.iter().filter(|cell| cell.is_some()).count();
         assert_eq!(initial, 12);
 
@@ -1231,6 +1368,58 @@ mod tests {
 
         let alive = jar.creatures.iter().filter(|cell| cell.is_some()).count();
         assert!(alive > initial, "популяция вымерла: {alive} <= {initial}");
+    }
+
+    #[test]
+    fn rng_is_deterministic() {
+        let mut first = Rng::new(42);
+        let mut second = Rng::new(42);
+
+        for _ in 0..16 {
+            assert_eq!(first.next_u64(), second.next_u64());
+        }
+    }
+
+    #[test]
+    fn rng_zero_seed_is_replaced() {
+        let mut rng = Rng::new(0);
+        assert_ne!(rng.next_u64(), 0);
+    }
+
+    #[test]
+    fn mutations_never_leave_genome_empty() {
+        let mut rng = Rng::new(7);
+        let mut genome = CreatureGenome::from_line(vec![CreatureAction::PhotoGrow]);
+
+        for _ in 0..1000 {
+            genome.mutate(&mut rng);
+            assert!(!genome.line.is_empty());
+        }
+    }
+
+    #[test]
+    fn jump_value_mutation_changes_value() {
+        let mut rng = Rng::new(123);
+        let mut genome = CreatureGenome::from_line(vec![CreatureAction::Jump(5)]);
+
+        assert!(genome.mutate_jump_value(&mut rng));
+        assert_ne!(genome.line[0], CreatureAction::Jump(5));
+    }
+
+    #[test]
+    fn mutations_eventually_change_genome() {
+        let mut rng = Rng::new(99);
+        let mut genome = CreatureGenome::standard();
+        let original = genome.clone();
+
+        for _ in 0..100 {
+            genome.mutate(&mut rng);
+            if genome.line != original.line {
+                break;
+            }
+        }
+
+        assert_ne!(genome.line, original.line);
     }
 
     #[test]
