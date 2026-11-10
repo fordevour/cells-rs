@@ -77,7 +77,7 @@ impl Speed {
     /// Следующая, более высокая скорость.
     fn faster(self) -> Self {
         match self {
-            Self::TicksPerFrame(n) => Self::TicksPerFrame(if n >= MAX_SPEED { n } else { n + 1 }),
+            Self::TicksPerFrame(n) => Self::TicksPerFrame(if n == MAX_SPEED { n } else { n + 1 }),
             Self::FramesPerTick(2) => Self::TicksPerFrame(1),
             Self::FramesPerTick(n) => Self::FramesPerTick(n - 1),
         }
