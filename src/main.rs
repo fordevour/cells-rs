@@ -33,7 +33,7 @@ const MAX_SPEED: u32 = u32::MAX;
 const MAX_FRAMES_PER_TICK: u32 = 64;
 
 fn main() {
-    let mut jar = Jar::new(10);
+    let mut jar = Jar::new(100);
     let c0 = Creature {
         genome: CreatureGenome {
             line: vec![
