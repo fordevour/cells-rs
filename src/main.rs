@@ -509,11 +509,8 @@ impl Jar {
                 // Если в клетке есть существо, берем его копию
                 match creature.genome.get_action() {
                     CreatureAction::Split => {
-                        if creature.energy >= 100 && creature.minerals > 10 {
-                            // Только если ресурсов хватает
-                            let (new_0, new_1) = creature.split(); // Деление ресурсов с приоритетом материнской клетке
-                            self.creatures[i] = Some(new_0); // На месте материнской клетки
-
+                        // Для деления нужно минимум 100 энергии и минимум 10 минералов
+                        if creature.energy >= 100 && creature.minerals >= 10 {
                             let i_x = i % self.size;
                             let i_y = i / self.size;
 
@@ -535,9 +532,16 @@ impl Jar {
                                 })
                                 .collect();
 
-                            if !nears.is_empty() {
+                            if nears.is_empty() {
+                                // Некуда делиться - клетка умирает, а все ее минералы
+                                // возвращаются обратно на карту
+                                self.minerals[i] += creature.minerals;
+                                self.creatures[i] = None;
+                            } else {
                                 // Есть куда положить дочернюю клетку
+                                let (new_0, new_1) = creature.split();
                                 let j = nears[self.tick % nears.len()]; // Выбор места дочерней клетки
+                                self.creatures[i] = Some(new_0); // На месте материнской клетки
                                 self.creatures[j] = Some(new_1);
                             }
                         } else {
@@ -582,12 +586,17 @@ pub struct Creature {
     pub minerals: usize,
 }
 impl Creature {
+    /// Делит клетку на две.
+    ///
+    /// Каждая дочерняя клетка получает по 40% изначальной энергии, остаток теряется
+    /// на само деление. Минералы делятся поровну без потерь: неделимый остаток
+    /// достается материнской клетке.
     pub fn split(&self) -> (Self, Self) {
         let energy = self.energy;
         let minerals = self.minerals;
 
-        let e_0 = (energy / 2) + (energy % 2);
-        let e_1 = energy - e_0;
+        let e_0 = energy * 40 / 100;
+        let e_1 = energy * 40 / 100;
 
         let m_0 = (minerals / 2) + (minerals % 2);
         let m_1 = minerals - m_0;
