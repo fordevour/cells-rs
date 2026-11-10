@@ -27,27 +27,17 @@ const CURSOR_REFERENCE_CELL_SIZE: u32 = 32;
 const MAX_CURSOR_STEP: u32 = 8;
 /// Сколько тиков живет клетка, после чего умирает.
 const CREATURE_LIFETIME_TICKS: usize = 1000;
+/// Максимальный прирост энергии от фотосинтеза за тик (у самого края).
+const MAX_PHOTOSYNTHESIS_ENERGY: usize = 4;
+/// Сколько энергии тратит поедание одного минерала.
+const EAT_MINERALS_ENERGY_COST: usize = 1;
 /// Максимальная скорость: столько тиков за кадр.
 const MAX_SPEED: u32 = u32::MAX;
 /// Максимальное замедление: один тик раз в столько кадров.
 const MAX_FRAMES_PER_TICK: u32 = 64;
 
 fn main() {
-    let mut jar = Jar::new(100);
-    let c0 = Creature {
-        genome: CreatureGenome {
-            line: vec![
-                CreatureAction::PhotoGrow,
-                CreatureAction::EatMinerals,
-                CreatureAction::Split,
-            ],
-            line_pointer: 0,
-        },
-        energy: 0,
-        minerals: 0,
-        age: 0,
-    };
-    jar.creatures[5 + (5 * 10)] = Some(c0);
+    let jar = seeded_jar();
 
     let event_loop = match EventLoop::new() {
         Ok(event_loop) => event_loop,
@@ -61,6 +51,80 @@ fn main() {
     let mut app = App::new(jar);
     if let Err(err) = event_loop.run_app(&mut app) {
         eprintln!("Ошибка event loop: {err}");
+    }
+}
+
+/// Создает Jar с четырьмя группами существ у разных краев.
+fn seeded_jar() -> Jar {
+    let mut jar = Jar::new(100);
+    let size = jar.size;
+    let mid = size / 2;
+
+    // По три клетки на каждом краю, рядом с зоной максимального света.
+    spawn(
+        &mut jar,
+        genome_top(),
+        &[(mid - 1, 2), (mid, 2), (mid + 1, 2)],
+    );
+    spawn(
+        &mut jar,
+        genome_right(),
+        &[(size - 3, mid - 1), (size - 3, mid), (size - 3, mid + 1)],
+    );
+    spawn(
+        &mut jar,
+        genome_bottom(),
+        &[(mid - 1, size - 3), (mid, size - 3), (mid + 1, size - 3)],
+    );
+    spawn(
+        &mut jar,
+        genome_left(),
+        &[(2, mid - 1), (2, mid), (2, mid + 1)],
+    );
+
+    jar
+}
+
+/// Стандартный геном: верхний край.
+fn genome_top() -> CreatureGenome {
+    CreatureGenome::standard()
+}
+
+/// Прыжки по ДНК вместо части делений: правый край.
+fn genome_right() -> CreatureGenome {
+    let mut genome = CreatureGenome::standard();
+    genome.line[3] = CreatureAction::Jump(1);
+    genome.line[7] = CreatureAction::Jump(2);
+    genome.line[11] = CreatureAction::Jump(1);
+    genome
+}
+
+/// Больше поедания минералов: нижний край.
+fn genome_bottom() -> CreatureGenome {
+    let mut genome = CreatureGenome::standard();
+    genome.line[4] = CreatureAction::EatMinerals;
+    genome.line[8] = CreatureAction::EatMinerals;
+    genome
+}
+
+/// Больше делений: левый край.
+fn genome_left() -> CreatureGenome {
+    let mut genome = CreatureGenome::standard();
+    genome.line[2] = CreatureAction::Split;
+    genome.line[6] = CreatureAction::Split;
+    genome
+}
+
+/// Размещает одинаковые геномы в указанных клетках поля.
+fn spawn(jar: &mut Jar, genome: CreatureGenome, positions: &[(usize, usize)]) {
+    let size = jar.size;
+    for &(x, y) in positions {
+        jar.creatures[x + y * size] = Some(Creature {
+            genome: genome.clone(),
+            energy: 0,
+            minerals: 0,
+            age: 0,
+        });
     }
 }
 
@@ -106,12 +170,16 @@ impl Speed {
 /// Режим просмотра поля.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ViewMode {
-    /// Основной режим: существа и минералы.
+    /// Основной режим: только существа.
     Creatures,
     /// Только концентрация минералов.
     Minerals,
     /// Только энергия существ.
     Energy,
+    /// Освещенность: свет у краев Jar и тьма в центре.
+    Light,
+    /// Цвета геномов: похожие ДНК окрашены похоже.
+    Genome,
 }
 
 impl ViewMode {
@@ -120,7 +188,9 @@ impl ViewMode {
         match self {
             Self::Creatures => Self::Minerals,
             Self::Minerals => Self::Energy,
-            Self::Energy => Self::Creatures,
+            Self::Energy => Self::Light,
+            Self::Light => Self::Genome,
+            Self::Genome => Self::Creatures,
         }
     }
 
@@ -130,6 +200,8 @@ impl ViewMode {
             Self::Creatures => "creatures",
             Self::Minerals => "minerals",
             Self::Energy => "energy",
+            Self::Light => "light",
+            Self::Genome => "genome",
         }
     }
 }
@@ -474,7 +546,7 @@ fn draw_snapshot(
                     if snapshot.creatures[index] {
                         CREATURE_COLOR
                     } else {
-                        mineral_color(snapshot.minerals[index])
+                        BACKGROUND_COLOR
                     }
                 }
                 ViewMode::Minerals => mineral_color(snapshot.minerals[index]),
@@ -485,6 +557,9 @@ fn draw_snapshot(
                         BACKGROUND_COLOR
                     }
                 }
+                // Свет рисуется отдельным пиксельным градиентом ниже.
+                ViewMode::Light => continue,
+                ViewMode::Genome => snapshot.genome_colors[index].unwrap_or(BACKGROUND_COLOR),
             };
 
             let px = offset_x + (x as u32 * cell) as i64;
@@ -493,33 +568,45 @@ fn draw_snapshot(
         }
     }
 
-    // Тонкая черная рамка вокруг каждой клетки поля.
-    for i in 0..=snapshot.size {
-        let x = offset_x + (i as u32 * cell) as i64;
-        let line_x = if i == snapshot.size { x - 1 } else { x };
-        fill_rect(
+    if view_mode == ViewMode::Light {
+        draw_light_field(
             buffer,
             width,
             height,
-            line_x,
-            offset_y,
-            CELL_BORDER_THICKNESS,
+            (offset_x, offset_y),
             grid,
-            BORDER_COLOR,
+            cell,
+            snapshot.size,
         );
+    } else {
+        // Тонкая черная рамка вокруг каждой клетки поля.
+        for i in 0..=snapshot.size {
+            let x = offset_x + (i as u32 * cell) as i64;
+            let line_x = if i == snapshot.size { x - 1 } else { x };
+            fill_rect(
+                buffer,
+                width,
+                height,
+                line_x,
+                offset_y,
+                CELL_BORDER_THICKNESS,
+                grid,
+                BORDER_COLOR,
+            );
 
-        let y = offset_y + (i as u32 * cell) as i64;
-        let line_y = if i == snapshot.size { y - 1 } else { y };
-        fill_rect(
-            buffer,
-            width,
-            height,
-            offset_x,
-            line_y,
-            grid,
-            CELL_BORDER_THICKNESS,
-            BORDER_COLOR,
-        );
+            let y = offset_y + (i as u32 * cell) as i64;
+            let line_y = if i == snapshot.size { y - 1 } else { y };
+            fill_rect(
+                buffer,
+                width,
+                height,
+                offset_x,
+                line_y,
+                grid,
+                CELL_BORDER_THICKNESS,
+                BORDER_COLOR,
+            );
+        }
     }
 
     // Более толстая рамка по внешним границам Jar.
@@ -579,6 +666,52 @@ fn draw_snapshot(
         selection_border,
         BORDER_COLOR,
     );
+}
+
+/// Плавный пиксельный градиент освещенности: свет у краев, тьма в центре.
+fn draw_light_field(
+    buffer: &mut [u32],
+    width: u32,
+    height: u32,
+    origin: (i64, i64),
+    grid: u32,
+    cell: u32,
+    size: usize,
+) {
+    let (offset_x, offset_y) = origin;
+    let reach_px = (light_reach(size) as u32 * cell).max(1);
+
+    // Палитра по расстоянию до ближайшего края в пикселях.
+    let mut palette = Vec::with_capacity(reach_px as usize);
+    for distance in 0..reach_px {
+        let remaining = reach_px - distance;
+        let intensity = (remaining * 255).div_ceil(reach_px) as u8;
+        palette.push(light_color(intensity));
+    }
+    let dark = light_color(0);
+
+    let x0 = offset_x.max(0).min(width as i64);
+    let y0 = offset_y.max(0).min(height as i64);
+    let x1 = (offset_x + grid as i64).max(0).min(width as i64);
+    let y1 = (offset_y + grid as i64).max(0).min(height as i64);
+
+    if x0 >= x1 || y0 >= y1 {
+        return;
+    }
+
+    let grid_size = grid as i64;
+    for py in y0..y1 {
+        let local_y = py - offset_y;
+        let dy = local_y.min(grid_size - 1 - local_y) as usize;
+        let row = (py as u32 * width) as usize;
+        for px in x0..x1 {
+            let local_x = px - offset_x;
+            let dx = local_x.min(grid_size - 1 - local_x) as usize;
+            let distance = dx.min(dy);
+            let color = palette.get(distance).copied().unwrap_or(dark);
+            buffer[row + px as usize] = color;
+        }
+    }
 }
 
 fn draw_cell_frame(
@@ -661,8 +794,129 @@ fn energy_color(energy: usize) -> u32 {
     rgb(r as u8, g as u8, b as u8)
 }
 
+/// Красивый градиент освещенности: от почти черной тьмы в центре
+/// через синий и теплый оранжевый к мягкому солнечному свету у края.
+fn light_color(intensity: u8) -> u32 {
+    const STOPS: [(u32, (u32, u32, u32)); 4] = [
+        (0, (8, 10, 24)),
+        (90, (36, 50, 112)),
+        (180, (212, 116, 52)),
+        (255, (255, 244, 190)),
+    ];
+
+    let value = intensity as u32;
+    for pair in STOPS.windows(2) {
+        let (from_value, from_color) = pair[0];
+        let (to_value, to_color) = pair[1];
+
+        if value <= to_value {
+            let t = (value - from_value) * 255 / (to_value - from_value);
+            let mix = |from: u32, to: u32| ((from * (255 - t) + to * t) / 255) as u8;
+            return rgb(
+                mix(from_color.0, to_color.0),
+                mix(from_color.1, to_color.1),
+                mix(from_color.2, to_color.2),
+            );
+        }
+    }
+
+    rgb(255, 244, 190)
+}
+
 fn rgb(r: u8, g: u8, b: u8) -> u32 {
     ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
+}
+
+/// Расстояние от клетки до ближайшего края Jar.
+fn distance_to_edge(x: usize, y: usize, size: usize) -> usize {
+    let last = size.saturating_sub(1);
+    x.min(y)
+        .min(last.saturating_sub(x))
+        .min(last.saturating_sub(y))
+}
+
+/// Половина расстояния от края до центра — дальше света нет.
+fn light_reach(size: usize) -> usize {
+    (size / 4).max(1)
+}
+
+/// Сколько энергии дает фотосинтез в клетке `(x, y)`.
+///
+/// Свет идет от краев Jar к центру и полностью затухает на половине пути
+/// к центру. Чем ближе клетка к краю, тем больше энергии она получает.
+fn light_level(x: usize, y: usize, size: usize) -> usize {
+    let reach = light_reach(size);
+    let distance = distance_to_edge(x, y, size);
+
+    if distance >= reach {
+        return 0;
+    }
+
+    MAX_PHOTOSYNTHESIS_ENERGY - MAX_PHOTOSYNTHESIS_ENERGY * distance / reach
+}
+
+/// Прибавляет `delta` к указателю ДНК, не позволяя ему стать отрицательным.
+fn apply_jump(pointer: usize, delta: isize) -> usize {
+    let next = pointer as isize + delta;
+    if next < 0 { 0 } else { next as usize }
+}
+
+/// Оттенок гена в градусах HSV.
+fn gene_hue(action: &CreatureAction) -> f32 {
+    match action {
+        CreatureAction::PhotoGrow => 120.0,
+        CreatureAction::EatMinerals => 240.0,
+        CreatureAction::Split => 0.0,
+        CreatureAction::Jump(_) => 300.0,
+    }
+}
+
+/// Цвет генома: взвешенная циркулярная средняя оттенков генов.
+///
+/// Насыщенность всегда 100%, поэтому смесь любых генов остается яркой
+/// и никогда не превращается в серый цвет.
+fn genome_color(genome: &CreatureGenome) -> u32 {
+    let mut sin_sum = 0.0f32;
+    let mut cos_sum = 0.0f32;
+
+    for (i, action) in genome.line.iter().enumerate() {
+        let weight = (i + 1) as f32;
+        let radians = gene_hue(action).to_radians();
+        sin_sum += weight * radians.sin();
+        cos_sum += weight * radians.cos();
+    }
+
+    // Если противоположные оттенки почти погасили друг друга,
+    // берем оттенок первого гена. Насыщенность все равно останется 100%.
+    let hue = if sin_sum * sin_sum + cos_sum * cos_sum < 1e-6 {
+        gene_hue(&genome.line[0])
+    } else {
+        sin_sum.atan2(cos_sum).to_degrees().rem_euclid(360.0)
+    };
+
+    hsv_to_rgb(hue, 1.0, 0.85)
+}
+
+/// Переводит HSV в packed RGB.
+fn hsv_to_rgb(hue: f32, saturation: f32, value: f32) -> u32 {
+    let h = hue.rem_euclid(360.0) / 60.0;
+    let c = value * saturation;
+    let x = c * (1.0 - (h % 2.0 - 1.0).abs());
+    let (r, g, b) = match h as u32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    let m = value - c;
+
+    rgb(
+        ((r + m) * 255.0).round() as u8,
+        ((g + m) * 255.0).round() as u8,
+        ((b + m) * 255.0).round() as u8,
+    )
 }
 
 pub struct Jar {
@@ -702,6 +956,11 @@ impl Jar {
                 .creatures
                 .iter()
                 .map(|cell| cell.as_ref().map_or(0, |creature| creature.energy))
+                .collect(),
+            genome_colors: self
+                .creatures
+                .iter()
+                .map(|cell| cell.as_ref().map(|creature| genome_color(&creature.genome)))
                 .collect(),
         }
     }
@@ -763,14 +1022,25 @@ impl Jar {
                         }
                     }
                     CreatureAction::PhotoGrow => {
-                        creature.energy += 1;
+                        let x = i % self.size;
+                        let y = i / self.size;
+                        creature.energy += light_level(x, y, self.size);
                         self.creatures[i] = Some(creature);
                     }
                     CreatureAction::EatMinerals => {
-                        if self.minerals[i] > 0 {
+                        // Есть можно, только если хватает энергии и минералов.
+                        if self.minerals[i] > 0 && creature.energy >= EAT_MINERALS_ENERGY_COST {
+                            creature.energy -= EAT_MINERALS_ENERGY_COST;
                             creature.minerals += 1;
                             self.minerals[i] -= 1;
                         }
+                        self.creatures[i] = Some(creature);
+                    }
+                    CreatureAction::Jump(delta) => {
+                        // get_action уже сдвинул указатель на +1, поэтому здесь
+                        // получается итоговый сдвиг +1+X.
+                        creature.genome.line_pointer =
+                            apply_jump(creature.genome.line_pointer, delta);
                         self.creatures[i] = Some(creature);
                     }
                 }
@@ -842,6 +1112,8 @@ pub enum CreatureAction {
     Split,
     PhotoGrow,
     EatMinerals,
+    /// Сдвинуть указатель ДНК на X (вдобавок к обычному +1).
+    Jump(isize),
 }
 #[derive(Clone, Debug)]
 pub struct CreatureGenome {
@@ -850,6 +1122,32 @@ pub struct CreatureGenome {
     pub line_pointer: usize,
 }
 impl CreatureGenome {
+    /// Стандартный геном из 16 генов.
+    ///
+    /// Базовый паттерн `[PhotoGrow, PhotoGrow, EatMinerals, Split]`
+    /// повторяется четыре раза.
+    pub fn standard() -> Self {
+        let pattern = [
+            CreatureAction::PhotoGrow,
+            CreatureAction::PhotoGrow,
+            CreatureAction::EatMinerals,
+            CreatureAction::Split,
+        ];
+
+        Self {
+            line: pattern.iter().cycle().take(16).copied().collect(),
+            line_pointer: 0,
+        }
+    }
+
+    /// Создает геном из готовой нити ДНК.
+    pub fn from_line(line: Vec<CreatureAction>) -> Self {
+        Self {
+            line,
+            line_pointer: 0,
+        }
+    }
+
     /// Выдает текущее действие клетки, сдвигает указатель действия на следующий
     pub fn get_action(&mut self) -> CreatureAction {
         let now_pointer = self.line_pointer % self.line.len();
@@ -867,4 +1165,105 @@ pub struct JarSnapshot {
     pub creatures: Vec<bool>,
     /// Энергия существ, 0 для пустых клеток.
     pub energies: Vec<usize>,
+    /// Цвет генома существа, `None` для пустых клеток.
+    pub genome_colors: Vec<Option<u32>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn standard_genome_has_16_genes() {
+        assert_eq!(CreatureGenome::standard().line.len(), 16);
+    }
+
+    #[test]
+    fn jump_adds_to_pointer_after_regular_step() {
+        let mut genome =
+            CreatureGenome::from_line(vec![CreatureAction::Jump(2), CreatureAction::PhotoGrow]);
+
+        let action = genome.get_action();
+        if let CreatureAction::Jump(delta) = action {
+            genome.line_pointer = apply_jump(genome.line_pointer, delta);
+        }
+
+        // get_action дал +1, Jump(2) добавил еще +2.
+        assert_eq!(genome.line_pointer, 3);
+    }
+
+    #[test]
+    fn negative_jump_does_not_underflow() {
+        assert_eq!(apply_jump(1, -5), 0);
+    }
+
+    #[test]
+    fn initial_genomes_have_distinct_colors() {
+        let colors = [genome_top(), genome_right(), genome_bottom(), genome_left()]
+            .map(|genome| genome_color(&genome));
+
+        for i in 0..colors.len() {
+            for j in (i + 1)..colors.len() {
+                assert_ne!(colors[i], colors[j], "цвета вариантов {i} и {j} совпали");
+            }
+        }
+    }
+
+    #[test]
+    fn spawn_places_creatures_at_positions() {
+        let mut jar = Jar::new(20);
+        spawn(&mut jar, genome_top(), &[(9, 2), (10, 2), (11, 2)]);
+
+        for (x, y) in [(9, 2), (10, 2), (11, 2)] {
+            assert!(jar.creatures[x + y * jar.size].is_some());
+        }
+    }
+
+    #[test]
+    fn initial_population_survives_and_grows() {
+        let mut jar = seeded_jar();
+        let initial = jar.creatures.iter().filter(|cell| cell.is_some()).count();
+        assert_eq!(initial, 12);
+
+        for _ in 0..300 {
+            jar.simulation_step();
+        }
+
+        let alive = jar.creatures.iter().filter(|cell| cell.is_some()).count();
+        assert!(alive > initial, "популяция вымерла: {alive} <= {initial}");
+    }
+
+    #[test]
+    fn genome_colors_are_never_gray() {
+        let genes = [
+            CreatureAction::PhotoGrow,
+            CreatureAction::EatMinerals,
+            CreatureAction::Split,
+            CreatureAction::Jump(1),
+        ];
+
+        // Перебираем периодические геномы с периодом 1..=4.
+        for period in 1..=4 {
+            let combinations = 4usize.pow(period as u32);
+            for mask in 0..combinations {
+                let mut rest = mask;
+                let mut pattern = Vec::with_capacity(period);
+                for _ in 0..period {
+                    pattern.push(genes[rest % genes.len()]);
+                    rest /= genes.len();
+                }
+
+                let line = (0..16).map(|i| pattern[i % period]).collect();
+                let color = genome_color(&CreatureGenome::from_line(line));
+                let r = (color >> 16) & 0xFF;
+                let g = (color >> 8) & 0xFF;
+                let b = color & 0xFF;
+
+                assert!(
+                    !(r == g && g == b),
+                    "геном дал серый цвет: pattern={pattern:?}, color={color:#08X}"
+                );
+            }
+        }
+    }
 }
