@@ -1,11 +1,13 @@
 fn main() {
-    let mut jar = Jar::new(5);
+    let mut jar = Jar::new(10);
     let c0 = Creature { genome: CreatureGenome { line: vec![CreatureAction::PhotoGrow, CreatureAction::EatMinerals, CreatureAction::Split], line_pointer: 0 }, energy: 0, minerals: 0};
-    jar.creatures[10 + (10 * 32)] = Some(c0);
+    jar.creatures[5 + (5 * 10)] = Some(c0);
 
     for _ in 0..1000 {
         jar.simulation_step();
-        println!("Энергия материнской клетки: {}", jar.creatures[330].clone().unwrap().energy);
+        jar.print();
+        println!();
+        std::thread::sleep(std::time::Duration::from_millis(10));
     }
 }
 
@@ -22,10 +24,8 @@ pub struct Jar {
     pub minerals: Vec<usize>,
 }
 impl Jar {
-    /// Размер квадратной "банки" как степень двойки.
-    /// Размер 10 означает, что размер поля 2^10 x 2^10 = 1024x1024 
-    pub fn new(log_size: usize) -> Self {
-        let size = 2usize.pow(log_size as u32);
+    /// Jar квадратная
+    pub fn new(size: usize) -> Self {
         let creatures = vec![None; size * size];
         let minerals = vec![100usize; size * size];
 
@@ -45,12 +45,23 @@ impl Jar {
                             let i_x = i % self.size;
                             let i_y = i / self.size;
 
-                            match self.tick % 4 { // Выбор места дочерней клетки
-                                0 => { self.creatures[(i_x + 1) + (i_y)*self.size] = Some(new_1) },
-                                1 => { self.creatures[(i_x - 1) + (i_y)*self.size] = Some(new_1) },
-                                2 => { self.creatures[i_x + (i_y + 1)*self.size] = Some(new_1) },
-                                3 => { self.creatures[i_x + (i_y - 1)*self.size] = Some(new_1) },
-                                _ => unreachable!()
+                            // Проверить рядомстоящие позиции. Если рядом свободно - добавить эту  позицию в массив
+                            let nears: Vec<usize> = [(1isize, 0isize), (-1, 0), (0, 1), (0, -1)]
+                                .iter()
+                                .filter_map(|&(dx, dy)| {
+                                    let x = i_x.checked_add_signed(dx)?;
+                                    let y = i_y.checked_add_signed(dy)?;
+                                    if x >= self.size || y >= self.size {
+                                        return None; // Вышли за границы поля
+                                    }
+                                    let j = x + y * self.size;
+                                    if self.creatures[j].is_none() { Some(j) } else { None }
+                                })
+                                .collect();
+
+                            if !nears.is_empty() { // Есть куда положить дочернюю клетку
+                                let j = nears[self.tick % nears.len()]; // Выбор места дочерней клетки
+                                self.creatures[j] = Some(new_1);
                             }
                         }
                         else {
@@ -70,6 +81,20 @@ impl Jar {
                     },
                 }
             }
+        }
+    }
+
+    pub fn print(&self) {
+        for y in 0..self.size {
+            for x in 0..self.size {
+                if self.creatures[x + y * self.size].is_none() {
+                    print!("·");
+                }
+                else {
+                    print!("█");
+                }
+            }
+            println!();
         }
     }
 }
