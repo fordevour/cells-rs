@@ -110,6 +110,8 @@ enum ViewMode {
     Main,
     /// Только концентрация минералов.
     Minerals,
+    /// Только энергия существ.
+    Energy,
 }
 
 impl ViewMode {
@@ -117,7 +119,8 @@ impl ViewMode {
     fn next(self) -> Self {
         match self {
             Self::Main => Self::Minerals,
-            Self::Minerals => Self::Main,
+            Self::Minerals => Self::Energy,
+            Self::Energy => Self::Main,
         }
     }
 
@@ -126,6 +129,7 @@ impl ViewMode {
         match self {
             Self::Main => "main",
             Self::Minerals => "minerals",
+            Self::Energy => "energy",
         }
     }
 }
@@ -474,6 +478,13 @@ fn draw_snapshot(
                     }
                 }
                 ViewMode::Minerals => mineral_color(snapshot.minerals[index]),
+                ViewMode::Energy => {
+                    if snapshot.creatures[index] {
+                        energy_color(snapshot.energies[index])
+                    } else {
+                        BACKGROUND_COLOR
+                    }
+                }
             };
 
             let px = offset_x + (x as u32 * cell) as i64;
@@ -641,6 +652,15 @@ fn mineral_color(minerals: usize) -> u32 {
     rgb(r as u8, g as u8, b as u8)
 }
 
+/// Белый фон с добавлением оранжевого: чем больше энергии, тем заметнее оттенок.
+fn energy_color(energy: usize) -> u32 {
+    let amount = energy.min(100) as u32;
+    let r = 255;
+    let g = 255 - amount * 140 / 100;
+    let b = 255 - amount * 230 / 100;
+    rgb(r as u8, g as u8, b as u8)
+}
+
 fn rgb(r: u8, g: u8, b: u8) -> u32 {
     ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
 }
@@ -678,6 +698,11 @@ impl Jar {
             tick: self.tick,
             minerals: self.minerals.clone(),
             creatures: self.creatures.iter().map(|cell| cell.is_some()).collect(),
+            energies: self
+                .creatures
+                .iter()
+                .map(|cell| cell.as_ref().map_or(0, |creature| creature.energy))
+                .collect(),
         }
     }
 
@@ -840,4 +865,6 @@ pub struct JarSnapshot {
     pub tick: usize,
     pub minerals: Vec<usize>,
     pub creatures: Vec<bool>,
+    /// Энергия существ, 0 для пустых клеток.
+    pub energies: Vec<usize>,
 }
