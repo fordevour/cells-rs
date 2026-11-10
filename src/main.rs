@@ -1,14 +1,282 @@
+use std::num::NonZeroU32;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use softbuffer::{Context, Surface};
+use winit::application::ApplicationHandler;
+use winit::dpi::LogicalSize;
+use winit::event::{MouseScrollDelta, WindowEvent};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::window::{Window, WindowId};
+
+const FRAME_TIME: Duration = Duration::from_micros(16_667);
+const MIN_CELL_SIZE: u32 = 1;
+const MAX_CELL_SIZE: u32 = 64;
+
+const BACKGROUND_COLOR: u32 = 0x0014_1418;
+const CREATURE_COLOR: u32 = 0x0040_d060;
+
 fn main() {
     let mut jar = Jar::new(10);
-    let c0 = Creature { genome: CreatureGenome { line: vec![CreatureAction::PhotoGrow, CreatureAction::EatMinerals, CreatureAction::Split], line_pointer: 0 }, energy: 0, minerals: 0};
+    let c0 = Creature {
+        genome: CreatureGenome {
+            line: vec![
+                CreatureAction::PhotoGrow,
+                CreatureAction::EatMinerals,
+                CreatureAction::Split,
+            ],
+            line_pointer: 0,
+        },
+        energy: 0,
+        minerals: 0,
+    };
     jar.creatures[5 + (5 * 10)] = Some(c0);
 
-    for _ in 0..1000 {
-        jar.simulation_step();
-        jar.print();
-        println!();
-        std::thread::sleep(std::time::Duration::from_millis(10));
+    let event_loop = match EventLoop::new() {
+        Ok(event_loop) => event_loop,
+        Err(err) => {
+            eprintln!("Не удалось создать event loop: {err}");
+            return;
+        }
+    };
+    event_loop.set_control_flow(ControlFlow::Wait);
+
+    let mut app = App::new(jar);
+    if let Err(err) = event_loop.run_app(&mut app) {
+        eprintln!("Ошибка event loop: {err}");
     }
+}
+
+/// Приложение winit: хранит Jar, раз в кадр обновляет снапшот и рисует его.
+struct App {
+    jar: Jar,
+    snapshot: JarSnapshot,
+
+    window: Option<Arc<Window>>,
+    context: Option<Context<Arc<Window>>>,
+    surface: Option<Surface<Arc<Window>, Arc<Window>>>,
+
+    /// Размер одной клетки в пикселях.
+    cell_size: u32,
+    next_frame: Instant,
+}
+
+impl App {
+    fn new(jar: Jar) -> Self {
+        let snapshot = jar.snapshot();
+        Self {
+            jar,
+            snapshot,
+            window: None,
+            context: None,
+            surface: None,
+            cell_size: 16,
+            next_frame: Instant::now(),
+        }
+    }
+
+    fn request_redraw(&self) {
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    fn zoom(&mut self, direction: i32) {
+        let step = (self.cell_size / 8).max(1) as i32;
+        let new_size = (self.cell_size as i32 + direction * step)
+            .clamp(MIN_CELL_SIZE as i32, MAX_CELL_SIZE as i32) as u32;
+
+        if new_size != self.cell_size {
+            self.cell_size = new_size;
+            self.request_redraw();
+        }
+    }
+
+    fn render(&mut self) {
+        let (Some(window), Some(surface)) = (self.window.as_ref(), self.surface.as_mut()) else {
+            return;
+        };
+
+        let size = window.inner_size();
+        let (Some(width), Some(height)) =
+            (NonZeroU32::new(size.width), NonZeroU32::new(size.height))
+        else {
+            return;
+        };
+
+        if let Err(err) = surface.resize(width, height) {
+            eprintln!("Не удалось изменить размер поверхности: {err}");
+            return;
+        }
+
+        let Ok(mut buffer) = surface.buffer_mut() else {
+            return;
+        };
+
+        let width = width.get();
+        let height = height.get();
+        buffer.fill(BACKGROUND_COLOR);
+        draw_snapshot(&mut buffer, width, height, &self.snapshot, self.cell_size);
+
+        if let Err(err) = buffer.present() {
+            eprintln!("Не удалось показать кадр: {err}");
+        }
+
+        window.set_title(&format!(
+            "Cells — тик {}, масштаб {}",
+            self.snapshot.tick, self.cell_size
+        ));
+    }
+}
+
+impl ApplicationHandler for App {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if self.window.is_some() {
+            return;
+        }
+
+        let attributes = Window::default_attributes()
+            .with_title("Cells")
+            .with_inner_size(LogicalSize::new(800.0, 800.0));
+
+        let window = match event_loop.create_window(attributes) {
+            Ok(window) => Arc::new(window),
+            Err(err) => {
+                eprintln!("Не удалось создать окно: {err}");
+                event_loop.exit();
+                return;
+            }
+        };
+
+        let context = match Context::new(window.clone()) {
+            Ok(context) => context,
+            Err(err) => {
+                eprintln!("Не удалось создать softbuffer context: {err}");
+                event_loop.exit();
+                return;
+            }
+        };
+
+        let surface = match Surface::new(&context, window.clone()) {
+            Ok(surface) => surface,
+            Err(err) => {
+                eprintln!("Не удалось создать softbuffer surface: {err}");
+                event_loop.exit();
+                return;
+            }
+        };
+
+        self.window = Some(window);
+        self.context = Some(context);
+        self.surface = Some(surface);
+        self.request_redraw();
+    }
+
+    fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
+        self.surface = None;
+        self.context = None;
+        self.window = None;
+    }
+
+    fn window_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        _window_id: WindowId,
+        event: WindowEvent,
+    ) {
+        match event {
+            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::Resized(_) => self.request_redraw(),
+            WindowEvent::RedrawRequested => self.render(),
+            WindowEvent::MouseWheel { delta, .. } => {
+                let scroll = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => y,
+                    MouseScrollDelta::PixelDelta(position) => position.y as f32 / 50.0,
+                };
+
+                if scroll > 0.0 {
+                    self.zoom(1);
+                } else if scroll < 0.0 {
+                    self.zoom(-1);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let now = Instant::now();
+
+        if now >= self.next_frame {
+            self.jar.simulation_step();
+            self.snapshot = self.jar.snapshot();
+            self.request_redraw();
+            self.next_frame = now + FRAME_TIME;
+        }
+
+        event_loop.set_control_flow(ControlFlow::WaitUntil(self.next_frame));
+    }
+}
+
+fn draw_snapshot(
+    buffer: &mut [u32],
+    width: u32,
+    height: u32,
+    snapshot: &JarSnapshot,
+    cell_size: u32,
+) {
+    let cell = cell_size.max(1);
+    let grid = snapshot.size as u32 * cell;
+    let offset_x = (width as i64 - grid as i64) / 2;
+    let offset_y = (height as i64 - grid as i64) / 2;
+    let gap = if cell >= 4 { 1 } else { 0 };
+
+    for y in 0..snapshot.size {
+        for x in 0..snapshot.size {
+            let index = x + y * snapshot.size;
+            let color = if snapshot.creatures[index] {
+                CREATURE_COLOR
+            } else {
+                let amount = snapshot.minerals[index].min(100) as u32;
+                let level = 16 + amount * 2;
+                rgb(level as u8, (level * 3 / 4) as u8, (level / 2) as u8)
+            };
+
+            let px = offset_x + (x as u32 * cell) as i64;
+            let py = offset_y + (y as u32 * cell) as i64;
+            fill_rect(buffer, width, height, px, py, cell - gap, cell - gap, color);
+        }
+    }
+}
+
+fn fill_rect(
+    buffer: &mut [u32],
+    width: u32,
+    height: u32,
+    x: i64,
+    y: i64,
+    rect_width: u32,
+    rect_height: u32,
+    color: u32,
+) {
+    let x0 = x.max(0).min(width as i64) as u32;
+    let y0 = y.max(0).min(height as i64) as u32;
+    let x1 = (x + rect_width as i64).max(0).min(width as i64) as u32;
+    let y1 = (y + rect_height as i64).max(0).min(height as i64) as u32;
+
+    if x0 >= x1 || y0 >= y1 {
+        return;
+    }
+
+    for row in y0..y1 {
+        let start = (row * width + x0) as usize;
+        let end = (row * width + x1) as usize;
+        buffer[start..end].fill(color);
+    }
+}
+
+fn rgb(r: u8, g: u8, b: u8) -> u32 {
+    ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
 }
 
 pub struct Jar {
@@ -29,16 +297,33 @@ impl Jar {
         let creatures = vec![None; size * size];
         let minerals = vec![100usize; size * size];
 
-        Self { size, tick: 0, creatures, minerals }
+        Self {
+            size,
+            tick: 0,
+            creatures,
+            minerals,
+        }
+    }
+
+    /// Создает снимок состояния мира для отрисовки.
+    pub fn snapshot(&self) -> JarSnapshot {
+        JarSnapshot {
+            size: self.size,
+            tick: self.tick,
+            minerals: self.minerals.clone(),
+            creatures: self.creatures.iter().map(|cell| cell.is_some()).collect(),
+        }
     }
 
     pub fn simulation_step(&mut self) {
         self.tick += 1;
         for i in 0..(self.size * self.size) {
-            if let Some(mut creature) = self.creatures[i].clone() { // Если в клетке есть существо, берем его копию
+            if let Some(mut creature) = self.creatures[i].clone() {
+                // Если в клетке есть существо, берем его копию
                 match creature.genome.get_action() {
                     CreatureAction::Split => {
-                        if creature.energy >= 100 && creature.minerals > 10 { // Только если ресурсов хватает
+                        if creature.energy >= 100 && creature.minerals > 10 {
+                            // Только если ресурсов хватает
                             let (new_0, new_1) = creature.split(); // Деление ресурсов с приоритетом материнской клетке
                             self.creatures[i] = Some(new_0); // На месте материнской клетки
 
@@ -55,19 +340,23 @@ impl Jar {
                                         return None; // Вышли за границы поля
                                     }
                                     let j = x + y * self.size;
-                                    if self.creatures[j].is_none() { Some(j) } else { None }
+                                    if self.creatures[j].is_none() {
+                                        Some(j)
+                                    } else {
+                                        None
+                                    }
                                 })
                                 .collect();
 
-                            if !nears.is_empty() { // Есть куда положить дочернюю клетку
+                            if !nears.is_empty() {
+                                // Есть куда положить дочернюю клетку
                                 let j = nears[self.tick % nears.len()]; // Выбор места дочерней клетки
                                 self.creatures[j] = Some(new_1);
                             }
-                        }
-                        else {
+                        } else {
                             self.creatures[i] = Some(creature);
                         }
-                    },
+                    }
                     CreatureAction::PhotoGrow => {
                         creature.energy += 1;
                         self.creatures[i] = Some(creature);
@@ -78,7 +367,7 @@ impl Jar {
                             self.minerals[i] -= 1;
                         }
                         self.creatures[i] = Some(creature);
-                    },
+                    }
                 }
             }
         }
@@ -89,8 +378,7 @@ impl Jar {
             for x in 0..self.size {
                 if self.creatures[x + y * self.size].is_none() {
                     print!("·");
-                }
-                else {
+                } else {
                     print!("█");
                 }
             }
@@ -102,9 +390,9 @@ impl Jar {
 pub struct Creature {
     /// Пока что введем абстракцию, что ген 0 - это фотосинтезировать, а при достижении энергии 100 клетка делится в случайную сторону
     pub genome: CreatureGenome,
-    
+
     pub energy: usize,
-    pub minerals: usize
+    pub minerals: usize,
 }
 impl Creature {
     pub fn split(&self) -> (Self, Self) {
@@ -117,8 +405,16 @@ impl Creature {
         let m_0 = (minerals / 2) + (minerals % 2);
         let m_1 = minerals - m_0;
 
-        let mut c_0 = Creature {genome: self.genome.clone(), energy: e_0, minerals: m_0};
-        let mut c_1 = Creature {genome: self.genome.clone(), energy: e_1, minerals: m_1};
+        let mut c_0 = Creature {
+            genome: self.genome.clone(),
+            energy: e_0,
+            minerals: m_0,
+        };
+        let mut c_1 = Creature {
+            genome: self.genome.clone(),
+            energy: e_1,
+            minerals: m_1,
+        };
 
         c_0.genome.line_pointer = 0;
         c_1.genome.line_pointer = 0;
@@ -137,7 +433,7 @@ pub enum CreatureAction {
 pub struct CreatureGenome {
     /// Нить "ДНК"
     pub line: Vec<CreatureAction>,
-    pub line_pointer: usize
+    pub line_pointer: usize,
 }
 impl CreatureGenome {
     /// Выдает текущее действие клетки, сдвигает указатель действия на следующий
@@ -146,4 +442,13 @@ impl CreatureGenome {
         self.line_pointer += 1;
         self.line[now_pointer]
     }
+}
+
+pub struct JarSnapshot {
+    /// Ширина и высота снимка
+    pub size: usize,
+    /// Номер тика, к которому относится снимок
+    pub tick: usize,
+    pub minerals: Vec<usize>,
+    pub creatures: Vec<bool>,
 }
