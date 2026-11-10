@@ -103,6 +103,33 @@ impl Speed {
     }
 }
 
+/// Режим просмотра поля.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ViewMode {
+    /// Основной режим: существа и минералы.
+    Main,
+    /// Только концентрация минералов.
+    Minerals,
+}
+
+impl ViewMode {
+    /// Следующий режим по кругу.
+    fn next(self) -> Self {
+        match self {
+            Self::Main => Self::Minerals,
+            Self::Minerals => Self::Main,
+        }
+    }
+
+    /// Подпись режима для заголовка окна.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Main => "main",
+            Self::Minerals => "minerals",
+        }
+    }
+}
+
 /// Приложение winit: хранит Jar, раз в кадр обновляет снапшот и рисует его.
 struct App {
     jar: Jar,
@@ -123,6 +150,8 @@ struct App {
     frame_accum: u32,
     /// Приостановлена ли симуляция.
     paused: bool,
+    /// Режим просмотра поля.
+    view_mode: ViewMode,
     next_frame: Instant,
 }
 
@@ -143,6 +172,7 @@ impl App {
             speed: Speed::TicksPerFrame(1),
             frame_accum: 0,
             paused: false,
+            view_mode: ViewMode::Main,
             next_frame: Instant::now(),
         }
     }
@@ -153,7 +183,7 @@ impl App {
         }
     }
 
-    /// Обновляет заголовок окна: тик, масштаб, скорость и состояние паузы.
+    /// Обновляет заголовок окна: тик, масштаб, скорость, режим и состояние паузы.
     fn update_title(&self) {
         let Some(window) = &self.window else {
             return;
@@ -161,10 +191,11 @@ impl App {
 
         let pause = if self.paused { ", пауза" } else { "" };
         window.set_title(&format!(
-            "Cells — тик {}, масштаб {}, скорость {}{}",
+            "Cells — тик {}, масштаб {}, скорость {}, режим {}{}",
             self.snapshot.tick,
             self.cell_size,
             self.speed.label(),
+            self.view_mode.label(),
             pause
         ));
     }
@@ -196,6 +227,13 @@ impl App {
         }
 
         self.update_title();
+    }
+
+    /// Переключает режим просмотра поля.
+    fn toggle_view_mode(&mut self) {
+        self.view_mode = self.view_mode.next();
+        self.update_title();
+        self.request_redraw();
     }
 
     fn zoom(&mut self, direction: i32) {
@@ -248,6 +286,7 @@ impl App {
             width,
             height,
             &self.snapshot,
+            self.view_mode,
             self.cell_size,
             self.cursor_x,
             self.cursor_y,
@@ -336,6 +375,7 @@ impl ApplicationHandler for App {
                             self.move_cursor(1, 0)
                         }
                         PhysicalKey::Code(KeyCode::Space) => self.toggle_pause(),
+                        PhysicalKey::Code(KeyCode::Tab) => self.toggle_view_mode(),
                         PhysicalKey::Code(KeyCode::Equal | KeyCode::NumpadAdd) => {
                             self.change_speed(1)
                         }
@@ -406,6 +446,7 @@ fn draw_snapshot(
     width: u32,
     height: u32,
     snapshot: &JarSnapshot,
+    view_mode: ViewMode,
     cell_size: u32,
     cursor_x: usize,
     cursor_y: usize,
@@ -424,10 +465,15 @@ fn draw_snapshot(
     for y in 0..snapshot.size {
         for x in 0..snapshot.size {
             let index = x + y * snapshot.size;
-            let color = if snapshot.creatures[index] {
-                CREATURE_COLOR
-            } else {
-                mineral_color(snapshot.minerals[index])
+            let color = match view_mode {
+                ViewMode::Main => {
+                    if snapshot.creatures[index] {
+                        CREATURE_COLOR
+                    } else {
+                        mineral_color(snapshot.minerals[index])
+                    }
+                }
+                ViewMode::Minerals => mineral_color(snapshot.minerals[index]),
             };
 
             let px = offset_x + (x as u32 * cell) as i64;
