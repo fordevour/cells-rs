@@ -107,7 +107,7 @@ impl Speed {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ViewMode {
     /// Основной режим: существа и минералы.
-    Main,
+    Creatures,
     /// Только концентрация минералов.
     Minerals,
     /// Только энергия существ.
@@ -118,16 +118,16 @@ impl ViewMode {
     /// Следующий режим по кругу.
     fn next(self) -> Self {
         match self {
-            Self::Main => Self::Minerals,
+            Self::Creatures => Self::Minerals,
             Self::Minerals => Self::Energy,
-            Self::Energy => Self::Main,
+            Self::Energy => Self::Creatures,
         }
     }
 
     /// Подпись режима для заголовка окна.
     fn label(self) -> &'static str {
         match self {
-            Self::Main => "main",
+            Self::Creatures => "creatures",
             Self::Minerals => "minerals",
             Self::Energy => "energy",
         }
@@ -176,7 +176,7 @@ impl App {
             speed: Speed::TicksPerFrame(1),
             frame_accum: 0,
             paused: false,
-            view_mode: ViewMode::Main,
+            view_mode: ViewMode::Creatures,
             next_frame: Instant::now(),
         }
     }
@@ -470,7 +470,7 @@ fn draw_snapshot(
         for x in 0..snapshot.size {
             let index = x + y * snapshot.size;
             let color = match view_mode {
-                ViewMode::Main => {
+                ViewMode::Creatures => {
                     if snapshot.creatures[index] {
                         CREATURE_COLOR
                     } else {
