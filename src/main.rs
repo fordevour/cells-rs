@@ -5,16 +5,26 @@ use std::time::{Duration, Instant};
 use softbuffer::{Context, Surface};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
-use winit::event::{MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 const FRAME_TIME: Duration = Duration::from_micros(16_667);
-const MIN_CELL_SIZE: u32 = 1;
+const MIN_CELL_SIZE: u32 = 3;
 const MAX_CELL_SIZE: u32 = 64;
 
-const BACKGROUND_COLOR: u32 = 0x0014_1418;
+const BACKGROUND_COLOR: u32 = 0x00FF_FFFF;
+const BORDER_COLOR: u32 = 0x0000_0000;
 const CREATURE_COLOR: u32 = 0x0040_d060;
+/// Толщина внешней рамки поля в пикселях.
+const FIELD_BORDER_THICKNESS: u32 = 2;
+/// Толщина рамок обычных клеток.
+const CELL_BORDER_THICKNESS: u32 = 1;
+/// При этом размере клетки курсор двигается на одну клетку за нажатие.
+const CURSOR_REFERENCE_CELL_SIZE: u32 = 32;
+/// Максимальный шаг курсора в клетках при сильном отдалении.
+const MAX_CURSOR_STEP: u32 = 8;
 
 fn main() {
     let mut jar = Jar::new(10);
@@ -58,12 +68,17 @@ struct App {
 
     /// Размер одной клетки в пикселях.
     cell_size: u32,
+    /// Позиция выбранной клетки.
+    cursor_x: usize,
+    cursor_y: usize,
     next_frame: Instant,
 }
 
 impl App {
     fn new(jar: Jar) -> Self {
         let snapshot = jar.snapshot();
+        let cursor_x = jar.size / 2;
+        let cursor_y = jar.size / 2;
         Self {
             jar,
             snapshot,
@@ -71,6 +86,8 @@ impl App {
             context: None,
             surface: None,
             cell_size: 16,
+            cursor_x,
+            cursor_y,
             next_frame: Instant::now(),
         }
     }
@@ -90,6 +107,16 @@ impl App {
             self.cell_size = new_size;
             self.request_redraw();
         }
+    }
+
+    /// Двигает курсор. Чем сильнее отдаление, тем больше шаг за одно нажатие.
+    fn move_cursor(&mut self, dx: isize, dy: isize) {
+        let step = (CURSOR_REFERENCE_CELL_SIZE / self.cell_size).clamp(1, MAX_CURSOR_STEP) as isize;
+        let last = self.snapshot.size.saturating_sub(1) as isize;
+
+        self.cursor_x = (self.cursor_x as isize + dx * step).clamp(0, last) as usize;
+        self.cursor_y = (self.cursor_y as isize + dy * step).clamp(0, last) as usize;
+        self.request_redraw();
     }
 
     fn render(&mut self) {
@@ -116,7 +143,15 @@ impl App {
         let width = width.get();
         let height = height.get();
         buffer.fill(BACKGROUND_COLOR);
-        draw_snapshot(&mut buffer, width, height, &self.snapshot, self.cell_size);
+        draw_snapshot(
+            &mut buffer,
+            width,
+            height,
+            &self.snapshot,
+            self.cell_size,
+            self.cursor_x,
+            self.cursor_y,
+        );
 
         if let Err(err) = buffer.present() {
             eprintln!("Не удалось показать кадр: {err}");
@@ -188,6 +223,21 @@ impl ApplicationHandler for App {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(_) => self.request_redraw(),
             WindowEvent::RedrawRequested => self.render(),
+            WindowEvent::KeyboardInput { event, .. } => {
+                if event.state == ElementState::Pressed {
+                    let direction = match event.physical_key {
+                        PhysicalKey::Code(KeyCode::KeyW | KeyCode::ArrowUp) => Some((0, -1)),
+                        PhysicalKey::Code(KeyCode::KeyS | KeyCode::ArrowDown) => Some((0, 1)),
+                        PhysicalKey::Code(KeyCode::KeyA | KeyCode::ArrowLeft) => Some((-1, 0)),
+                        PhysicalKey::Code(KeyCode::KeyD | KeyCode::ArrowRight) => Some((1, 0)),
+                        _ => None,
+                    };
+
+                    if let Some((dx, dy)) = direction {
+                        self.move_cursor(dx, dy);
+                    }
+                }
+            }
             WindowEvent::MouseWheel { delta, .. } => {
                 let scroll = match delta {
                     MouseScrollDelta::LineDelta(_, y) => y,
@@ -224,29 +274,157 @@ fn draw_snapshot(
     height: u32,
     snapshot: &JarSnapshot,
     cell_size: u32,
+    cursor_x: usize,
+    cursor_y: usize,
 ) {
     let cell = cell_size.max(1);
     let grid = snapshot.size as u32 * cell;
-    let offset_x = (width as i64 - grid as i64) / 2;
-    let offset_y = (height as i64 - grid as i64) / 2;
-    let gap = if cell >= 4 { 1 } else { 0 };
 
+    // Курсор всегда находится в центре окна, поэтому смещение карты
+    // рассчитывается относительно выбранной клетки.
+    let cursor_center_x = (cursor_x as u32 * cell + cell / 2) as i64;
+    let cursor_center_y = (cursor_y as u32 * cell + cell / 2) as i64;
+    let offset_x = width as i64 / 2 - cursor_center_x;
+    let offset_y = height as i64 / 2 - cursor_center_y;
+
+    // Заливка клеток: существа, минералы или пустое пространство.
     for y in 0..snapshot.size {
         for x in 0..snapshot.size {
             let index = x + y * snapshot.size;
             let color = if snapshot.creatures[index] {
                 CREATURE_COLOR
             } else {
-                let amount = snapshot.minerals[index].min(100) as u32;
-                let level = 16 + amount * 2;
-                rgb(level as u8, (level * 3 / 4) as u8, (level / 2) as u8)
+                mineral_color(snapshot.minerals[index])
             };
 
             let px = offset_x + (x as u32 * cell) as i64;
             let py = offset_y + (y as u32 * cell) as i64;
-            fill_rect(buffer, width, height, px, py, cell - gap, cell - gap, color);
+            fill_rect(buffer, width, height, px, py, cell, cell, color);
         }
     }
+
+    // Тонкая черная рамка вокруг каждой клетки поля.
+    for i in 0..=snapshot.size {
+        let x = offset_x + (i as u32 * cell) as i64;
+        let line_x = if i == snapshot.size { x - 1 } else { x };
+        fill_rect(
+            buffer,
+            width,
+            height,
+            line_x,
+            offset_y,
+            CELL_BORDER_THICKNESS,
+            grid,
+            BORDER_COLOR,
+        );
+
+        let y = offset_y + (i as u32 * cell) as i64;
+        let line_y = if i == snapshot.size { y - 1 } else { y };
+        fill_rect(
+            buffer,
+            width,
+            height,
+            offset_x,
+            line_y,
+            grid,
+            CELL_BORDER_THICKNESS,
+            BORDER_COLOR,
+        );
+    }
+
+    // Более толстая рамка по внешним границам Jar.
+    let border = FIELD_BORDER_THICKNESS.min(cell);
+    fill_rect(
+        buffer,
+        width,
+        height,
+        offset_x,
+        offset_y,
+        grid,
+        border,
+        BORDER_COLOR,
+    );
+    fill_rect(
+        buffer,
+        width,
+        height,
+        offset_x,
+        offset_y + grid as i64 - border as i64,
+        grid,
+        border,
+        BORDER_COLOR,
+    );
+    fill_rect(
+        buffer,
+        width,
+        height,
+        offset_x,
+        offset_y,
+        border,
+        grid,
+        BORDER_COLOR,
+    );
+    fill_rect(
+        buffer,
+        width,
+        height,
+        offset_x + grid as i64 - border as i64,
+        offset_y,
+        border,
+        grid,
+        BORDER_COLOR,
+    );
+
+    // Выделенная клетка: более толстая рамка.
+    let selection_border = (cell / 5).clamp(2, 4).min(cell);
+    let cursor_px = offset_x + (cursor_x as u32 * cell) as i64;
+    let cursor_py = offset_y + (cursor_y as u32 * cell) as i64;
+    draw_cell_frame(
+        buffer,
+        width,
+        height,
+        cursor_px,
+        cursor_py,
+        cell,
+        selection_border,
+        BORDER_COLOR,
+    );
+}
+
+fn draw_cell_frame(
+    buffer: &mut [u32],
+    width: u32,
+    height: u32,
+    x: i64,
+    y: i64,
+    cell: u32,
+    thickness: u32,
+    color: u32,
+) {
+    let thickness = thickness.clamp(1, cell);
+
+    fill_rect(buffer, width, height, x, y, cell, thickness, color);
+    fill_rect(
+        buffer,
+        width,
+        height,
+        x,
+        y + cell as i64 - thickness as i64,
+        cell,
+        thickness,
+        color,
+    );
+    fill_rect(buffer, width, height, x, y, thickness, cell, color);
+    fill_rect(
+        buffer,
+        width,
+        height,
+        x + cell as i64 - thickness as i64,
+        y,
+        thickness,
+        cell,
+        color,
+    );
 }
 
 fn fill_rect(
@@ -273,6 +451,15 @@ fn fill_rect(
         let end = (row * width + x1) as usize;
         buffer[start..end].fill(color);
     }
+}
+
+/// Белый фон с добавлением синего: чем больше минералов, тем заметнее оттенок.
+fn mineral_color(minerals: usize) -> u32 {
+    let amount = minerals.min(100) as u32;
+    let r = 255 - amount * 64 / 100;
+    let g = 255 - amount * 43 / 100;
+    let b = 255;
+    rgb(r as u8, g as u8, b as u8)
 }
 
 fn rgb(r: u8, g: u8, b: u8) -> u32 {
