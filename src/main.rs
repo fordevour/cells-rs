@@ -14,7 +14,7 @@ const FRAME_TIME: Duration = Duration::from_micros(16_667);
 const MIN_CELL_SIZE: u32 = 3;
 const MAX_CELL_SIZE: u32 = 64;
 
-const BACKGROUND_COLOR: u32 = 0x00FF_FFFF;
+pub(crate) const BACKGROUND_COLOR: u32 = 0x00FF_FFFF;
 const BORDER_COLOR: u32 = 0x0000_0000;
 const CREATURE_COLOR: u32 = 0x0040_d060;
 /// Толщина внешней рамки поля в пикселях.
@@ -117,7 +117,7 @@ fn main() {
 }
 
 /// Создает Jar с четырьмя группами существ у разных краев.
-fn seeded_jar() -> Jar {
+pub(crate) fn seeded_jar() -> Jar {
     let mut jar = Jar::new(100);
     let size = jar.size;
     let mid = size / 2;
@@ -148,12 +148,12 @@ fn seeded_jar() -> Jar {
 }
 
 /// Стандартный геном: верхний край.
-fn genome_top() -> CreatureGenome {
+pub(crate) fn genome_top() -> CreatureGenome {
     CreatureGenome::standard()
 }
 
 /// Прыжки по ДНК вместо части делений: правый край.
-fn genome_right() -> CreatureGenome {
+pub(crate) fn genome_right() -> CreatureGenome {
     let mut genome = CreatureGenome::standard();
     genome.line[3] = CreatureAction::Jump(1);
     genome.line[7] = CreatureAction::Jump(2);
@@ -162,7 +162,7 @@ fn genome_right() -> CreatureGenome {
 }
 
 /// Больше поедания минералов: нижний край.
-fn genome_bottom() -> CreatureGenome {
+pub(crate) fn genome_bottom() -> CreatureGenome {
     let mut genome = CreatureGenome::standard();
     genome.line[4] = CreatureAction::EatMinerals;
     genome.line[8] = CreatureAction::EatMinerals;
@@ -170,7 +170,7 @@ fn genome_bottom() -> CreatureGenome {
 }
 
 /// Больше делений: левый край.
-fn genome_left() -> CreatureGenome {
+pub(crate) fn genome_left() -> CreatureGenome {
     let mut genome = CreatureGenome::standard();
     genome.line[2] = CreatureAction::Split;
     genome.line[6] = CreatureAction::Split;
@@ -231,7 +231,7 @@ impl Speed {
 
 /// Режим просмотра поля.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum ViewMode {
+pub(crate) enum ViewMode {
     /// Основной режим: только существа.
     Creatures,
     /// Только концентрация минералов.
@@ -257,7 +257,7 @@ impl ViewMode {
     }
 
     /// Подпись режима для заголовка окна.
-    fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Creatures => "creatures",
             Self::Minerals => "minerals",
@@ -579,7 +579,7 @@ impl ApplicationHandler for App {
     }
 }
 
-fn draw_snapshot(
+pub(crate) fn draw_snapshot(
     buffer: &mut [u32],
     width: u32,
     height: u32,
@@ -937,7 +937,7 @@ fn gene_hue(action: &CreatureAction) -> f32 {
 ///
 /// Насыщенность всегда 100%, поэтому смесь любых генов остается яркой
 /// и никогда не превращается в серый цвет.
-fn genome_color(genome: &CreatureGenome) -> u32 {
+pub(crate) fn genome_color(genome: &CreatureGenome) -> u32 {
     let mut sin_sum = 0.0f32;
     let mut cos_sum = 0.0f32;
 
