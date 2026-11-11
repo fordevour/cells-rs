@@ -5,7 +5,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use softbuffer::{Context, Surface};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
-use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
@@ -14,10 +14,12 @@ const FRAME_TIME: Duration = Duration::from_micros(16_667);
 const MIN_CELL_SIZE: u32 = 3;
 const MAX_CELL_SIZE: u32 = 64;
 
-/// При этом размере клетки курсор двигается на одну клетку за нажатие.
-const CURSOR_REFERENCE_CELL_SIZE: u32 = 32;
-/// Максимальный шаг курсора в клетках при сильном отдалении.
-const MAX_CURSOR_STEP: u32 = 8;
+/// Задержка перед автоповтором перемещения выделения.
+const REPEAT_DELAY: Duration = Duration::from_millis(180);
+/// Интервал автоповтора в начале удержания клавиши.
+const REPEAT_INTERVAL_START: Duration = Duration::from_millis(45);
+/// Минимальный интервал автоповтора: предельная скорость перемещения.
+const REPEAT_INTERVAL_MIN: Duration = Duration::from_millis(12);
 /// Сколько тиков живет клетка, после чего умирает.
 const CREATURE_LIFETIME_TICKS: usize = 1000;
 /// Максимальный прирост энергии от фотосинтеза за тик (у самого края).
@@ -78,8 +80,6 @@ struct Palette {
     jar_shadow: u32,
     /// Обычное существо.
     creature: u32,
-    /// Кольцо под указателем мыши.
-    hover: u32,
     /// Тёмная часть курсора.
     cursor_dark: u32,
     /// Светлая часть курсора.
@@ -104,7 +104,6 @@ impl Palette {
             jar_frame: 0x002B_2F36,
             jar_shadow: 0x00C8_CCD2,
             creature: 0x003F_B950,
-            hover: 0x005B_8DEF,
             cursor_dark: 0x001F_2430,
             cursor_light: 0x00FF_FFFF,
             panel_bg: 0x00FF_FFFF,
@@ -391,6 +390,60 @@ impl ViewMode {
     }
 }
 
+/// Направление перемещения выделения.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Direction {
+    Up,
+    Down,
+    Left,
+    Right,
+}
+
+impl Direction {
+    /// Сдвиг на одну клетку.
+    fn delta(self) -> (isize, isize) {
+        match self {
+            Self::Up => (0, -1),
+            Self::Down => (0, 1),
+            Self::Left => (-1, 0),
+            Self::Right => (1, 0),
+        }
+    }
+
+    /// Направление по нажатой клавише.
+    fn from_key(key: PhysicalKey) -> Option<Self> {
+        match key {
+            PhysicalKey::Code(KeyCode::KeyW | KeyCode::ArrowUp) => Some(Self::Up),
+            PhysicalKey::Code(KeyCode::KeyS | KeyCode::ArrowDown) => Some(Self::Down),
+            PhysicalKey::Code(KeyCode::KeyA | KeyCode::ArrowLeft) => Some(Self::Left),
+            PhysicalKey::Code(KeyCode::KeyD | KeyCode::ArrowRight) => Some(Self::Right),
+            _ => None,
+        }
+    }
+}
+
+/// Интервал автоповтора: чем дольше удерживаем клавишу, тем быстрее едем.
+///
+/// За первую секунду интервал падает с 45 мс до 12 мс: это примерно
+/// 22 клетки в секунду в начале и 83 клетки в секунду на пределе.
+fn repeat_interval(held_for: Duration) -> Duration {
+    let start = REPEAT_INTERVAL_START.as_millis() as u32;
+    let minimum = REPEAT_INTERVAL_MIN.as_millis() as u32;
+    let elapsed = held_for.as_millis() as u32;
+
+    let interval = start
+        .saturating_sub(elapsed * (start - minimum) / 1000)
+        .max(minimum);
+
+    Duration::from_millis(interval as u64)
+}
+
+/// Помещается ли поле целиком в окно при таком размере клетки.
+fn field_fits(cell_size: u32, size: usize, width: u32, height: u32) -> bool {
+    let grid = size as u32 * cell_size;
+    grid <= width && grid <= height
+}
+
 /// Данные выбранной клетки для панели инспектора.
 struct CellInfo {
     /// Координаты клетки в поле.
@@ -427,13 +480,15 @@ struct App {
     cell_size: u32,
     /// Размер клетки, при котором поле целиком влезает в окно.
     fit_cell_size: u32,
+    /// Размер окна в пикселях: нужен, чтобы знать, помещается ли поле.
+    window_size: (u32, u32),
     /// Позиция выбранной клетки.
     cursor_x: usize,
     cursor_y: usize,
-    /// Клетка под указателем мыши.
-    hover: Option<(usize, usize)>,
-    /// Позиция указателя мыши в пикселях окна.
-    mouse: Option<(f64, f64)>,
+    /// Направление, которое сейчас удерживается, и момент нажатия.
+    hold: Option<(Direction, Instant)>,
+    /// Когда сработает следующий автоповтор перемещения.
+    next_repeat: Instant,
     /// Скорость симуляции.
     speed: Speed,
     /// Сколько кадров накоплено при замедленном режиме.
@@ -475,10 +530,11 @@ impl App {
             palette,
             cell_size: 8,
             fit_cell_size: 8,
+            window_size: (800, 800),
             cursor_x,
             cursor_y,
-            hover: None,
-            mouse: None,
+            hold: None,
+            next_repeat: Instant::now(),
             speed: Speed::TicksPerFrame(1),
             frame_accum: 0,
             paused: false,
@@ -511,6 +567,10 @@ impl App {
 
     /// Масштаб относительно вписанного вида.
     fn zoom_label(&self) -> String {
+        if !self.selection_active() {
+            return "fit".to_string();
+        }
+
         let fit = self.fit_cell_size.max(1) as f32;
         format!("x{:.1}", self.cell_size as f32 / fit)
     }
@@ -577,29 +637,109 @@ impl App {
         let new_size = (self.cell_size as i32 + direction * step)
             .clamp(MIN_CELL_SIZE as i32, MAX_CELL_SIZE as i32) as u32;
 
-        if new_size != self.cell_size {
-            self.cell_size = new_size;
-            self.request_redraw();
-        }
+        self.set_cell_size(new_size);
     }
 
     /// Вписывает поле в окно целиком.
     fn fit_zoom(&mut self) {
-        let new_size = self.fit_cell_size.clamp(MIN_CELL_SIZE, MAX_CELL_SIZE);
-        if new_size != self.cell_size {
-            self.cell_size = new_size;
-            self.request_redraw();
-        }
+        self.set_cell_size(self.fit_cell_size);
     }
 
-    /// Двигает курсор. Чем сильнее отдаление, тем больше шаг за одно нажатие.
-    fn move_cursor(&mut self, dx: isize, dy: isize) {
-        let step = (CURSOR_REFERENCE_CELL_SIZE / self.cell_size).clamp(1, MAX_CURSOR_STEP) as isize;
+    /// Меняет размер клетки и пересчитывает выделение, если поле перестало
+    /// помещаться в окно или снова поместилось.
+    fn set_cell_size(&mut self, new_size: u32) {
+        let new_size = new_size.clamp(MIN_CELL_SIZE, MAX_CELL_SIZE);
+        if new_size == self.cell_size {
+            return;
+        }
+
+        let (width, height) = self.window_size;
+        let was_fitting = field_fits(self.cell_size, self.snapshot.size, width, height);
+        let will_fit = field_fits(new_size, self.snapshot.size, width, height);
+
+        if was_fitting && !will_fit {
+            // Поле перестало помещаться: выделение появляется в центре экрана,
+            // чтобы камера осталась на месте.
+            let (x, y) = self.center_cell();
+            self.cursor_x = x;
+            self.cursor_y = y;
+        }
+
+        self.cell_size = new_size;
+        self.request_redraw();
+    }
+
+    /// Существует ли сейчас выделение клетки.
+    ///
+    /// Пока поле целиком помещается в окне, выделения нет: камера центрирует
+    /// поле, курсор не нужен.
+    fn selection_active(&self) -> bool {
+        !field_fits(
+            self.cell_size,
+            self.snapshot.size,
+            self.window_size.0,
+            self.window_size.1,
+        )
+    }
+
+    /// Клетка, оказавшаяся в центре текущего вида.
+    fn center_cell(&self) -> (usize, usize) {
+        let (offset_x, offset_y) = field_offset(
+            (self.cursor_x, self.cursor_y),
+            self.snapshot.size,
+            self.cell_size,
+            self.window_size.0,
+            self.window_size.1,
+        );
+
+        let cell = self.cell_size.max(1) as i64;
+        let last = self.snapshot.size.saturating_sub(1) as i64;
+
+        let x = ((self.window_size.0 as i64 / 2 - offset_x) / cell).clamp(0, last) as usize;
+        let y = ((self.window_size.1 as i64 / 2 - offset_y) / cell).clamp(0, last) as usize;
+
+        (x, y)
+    }
+
+    /// Сдвигает выделение на одну клетку в заданном направлении.
+    fn move_selection(&mut self, direction: Direction) {
+        // Пока поле помещается в окно, выделения нет: двигать нечего.
+        if !self.selection_active() {
+            return;
+        }
+
+        let (dx, dy) = direction.delta();
         let last = self.snapshot.size.saturating_sub(1) as isize;
 
-        self.cursor_x = (self.cursor_x as isize + dx * step).clamp(0, last) as usize;
-        self.cursor_y = (self.cursor_y as isize + dy * step).clamp(0, last) as usize;
+        self.cursor_x = (self.cursor_x as isize + dx).clamp(0, last) as usize;
+        self.cursor_y = (self.cursor_y as isize + dy).clamp(0, last) as usize;
         self.request_redraw();
+    }
+
+    /// Нажата клавиша движения: первый сдвиг и запуск автоповтора.
+    fn press_direction(&mut self, direction: Direction) {
+        self.hold = Some((direction, Instant::now()));
+        self.next_repeat = Instant::now() + REPEAT_DELAY;
+        self.move_selection(direction);
+    }
+
+    /// Клавиша движения отпущена: автоповтор прекращается.
+    fn release_direction(&mut self) {
+        self.hold = None;
+    }
+
+    /// Автоповтор: пока клавиша удерживается, выделение едет.
+    fn update_repeat(&mut self, now: Instant) {
+        let Some((direction, since)) = self.hold else {
+            return;
+        };
+
+        if now < self.next_repeat {
+            return;
+        }
+
+        self.move_selection(direction);
+        self.next_repeat = now + repeat_interval(now.duration_since(since));
     }
 
     /// Пересчитывает вспышки рождения и смерти по разнице двух кадров.
@@ -615,29 +755,6 @@ impl App {
 
         self.prev_creatures
             .copy_from_slice(&self.snapshot.creatures);
-    }
-
-    /// Клетка под указателем мыши: пересчитывается каждый кадр,
-    /// потому что камера центрирована на курсоре и смещается под мышью.
-    fn update_hover(&mut self, width: u32, height: u32) {
-        let Some((mouse_x, mouse_y)) = self.mouse else {
-            self.hover = None;
-            return;
-        };
-
-        let (offset_x, offset_y) = field_offset(
-            (self.cursor_x, self.cursor_y),
-            self.snapshot.size,
-            self.cell_size,
-            width,
-            height,
-        );
-        let cell = self.cell_size.max(1) as i64;
-        let last = self.snapshot.size.saturating_sub(1) as i64;
-
-        let x = ((mouse_x as i64 - offset_x) / cell).clamp(0, last);
-        let y = ((mouse_y as i64 - offset_y) / cell).clamp(0, last);
-        self.hover = Some((x as usize, y as usize));
     }
 
     /// Данные выбранной клетки для инспектора.
@@ -684,7 +801,7 @@ impl App {
         };
 
         // Всё, что читает состояние мира, считаем до того, как взяли поверхность.
-        self.update_hover(width.get(), height.get());
+        let selection_active = self.selection_active();
         let info = self.cell_info();
         let minerals: usize = self.snapshot.minerals.iter().sum();
         let hud_top = format!(
@@ -722,7 +839,7 @@ impl App {
                 cell_size: self.cell_size,
                 flashes: &self.flashes,
                 cell_layer: &mut self.cell_layer,
-                hover: self.hover,
+                selection_active,
                 cursor: (self.cursor_x, self.cursor_y),
                 info,
                 hud_top,
@@ -793,6 +910,7 @@ impl ApplicationHandler for App {
             .as_ref()
             .expect("окно только что создано")
             .inner_size();
+        self.window_size = (size.width, size.height);
         self.fit_cell_size = fit_cell_size(size.width, size.height, self.jar.size);
         self.cell_size = self.fit_cell_size;
 
@@ -803,6 +921,8 @@ impl ApplicationHandler for App {
         self.surface = None;
         self.context = None;
         self.window = None;
+        // Клавиша отпускания может не прийти: останавливаем автоповтор.
+        self.release_direction();
     }
 
     fn window_event(
@@ -814,41 +934,34 @@ impl ApplicationHandler for App {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
+                self.window_size = (size.width, size.height);
                 self.fit_cell_size = fit_cell_size(size.width, size.height, self.jar.size);
                 self.request_redraw();
             }
             WindowEvent::RedrawRequested => self.render(),
-            WindowEvent::CursorMoved { position, .. } => {
-                self.mouse = Some((position.x, position.y));
-                self.request_redraw();
-            }
-            WindowEvent::MouseInput {
-                state: ElementState::Pressed,
-                button: MouseButton::Left,
-                ..
-            } => {
-                // Клик выбирает клетку под указателем мыши.
-                if let Some((x, y)) = self.hover {
-                    self.cursor_x = x;
-                    self.cursor_y = y;
-                    self.request_redraw();
-                }
+            WindowEvent::Focused(false) => {
+                // При потере фокуса окно не пришлёт отпускание клавиши.
+                self.release_direction();
             }
             WindowEvent::KeyboardInput { event, .. } => {
+                // Клавиши перемещения работают в обоих состояниях:
+                // нажатие двигает выделение, отпускание останавливает автоповтор.
+                if let Some(direction) = Direction::from_key(event.physical_key) {
+                    match event.state {
+                        ElementState::Pressed => {
+                            // Системный автоповтор игнорируем: свой считаем сами,
+                            // иначе выделение сдвигалось бы на две клетки.
+                            if !event.repeat {
+                                self.press_direction(direction);
+                            }
+                        }
+                        ElementState::Released => self.release_direction(),
+                    }
+                    return;
+                }
+
                 if event.state == ElementState::Pressed {
                     match event.physical_key {
-                        PhysicalKey::Code(KeyCode::KeyW | KeyCode::ArrowUp) => {
-                            self.move_cursor(0, -1)
-                        }
-                        PhysicalKey::Code(KeyCode::KeyS | KeyCode::ArrowDown) => {
-                            self.move_cursor(0, 1)
-                        }
-                        PhysicalKey::Code(KeyCode::KeyA | KeyCode::ArrowLeft) => {
-                            self.move_cursor(-1, 0)
-                        }
-                        PhysicalKey::Code(KeyCode::KeyD | KeyCode::ArrowRight) => {
-                            self.move_cursor(1, 0)
-                        }
                         PhysicalKey::Code(KeyCode::Space) => self.toggle_pause(),
                         PhysicalKey::Code(KeyCode::Tab) => self.toggle_view_mode(),
                         PhysicalKey::Code(KeyCode::KeyF) => self.fit_zoom(),
@@ -879,12 +992,20 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let now = Instant::now();
+
+        // Автоповтор перемещения работает и на паузе.
+        self.update_repeat(now);
+
         if self.paused {
-            event_loop.set_control_flow(ControlFlow::Wait);
+            // На паузе спим, но если клавиша удерживается, просыпаемся ради неё.
+            if self.hold.is_some() {
+                event_loop.set_control_flow(ControlFlow::WaitUntil(self.next_repeat));
+            } else {
+                event_loop.set_control_flow(ControlFlow::Wait);
+            }
             return;
         }
-
-        let now = Instant::now();
 
         if now >= self.next_frame {
             let stepped = match self.speed {
@@ -914,7 +1035,12 @@ impl ApplicationHandler for App {
             self.next_frame = now + FRAME_TIME;
         }
 
-        event_loop.set_control_flow(ControlFlow::WaitUntil(self.next_frame));
+        // Просыпаемся на кадр симуляции или на момент автоповтора — что раньше.
+        let mut wake = self.next_frame;
+        if self.hold.is_some() && self.next_repeat < wake {
+            wake = self.next_repeat;
+        }
+        event_loop.set_control_flow(ControlFlow::WaitUntil(wake));
     }
 }
 
@@ -932,8 +1058,8 @@ struct RenderContext<'a> {
     flashes: &'a [u8],
     /// Цвета клеток прошлого кадра: нужны для сглаживания шкалы.
     cell_layer: &'a mut Vec<u32>,
-    /// Клетка под указателем мыши.
-    hover: Option<(usize, usize)>,
+    /// Есть ли сейчас выделение клетки.
+    selection_active: bool,
     /// Выбранная клетка.
     cursor: (usize, usize),
     /// Данные выбранной клетки для инспектора.
@@ -1015,7 +1141,7 @@ pub(crate) fn draw_frame(
         cell_size,
         flashes: &flashes,
         cell_layer: &mut cell_layer,
-        hover: None,
+        selection_active: !field_fits(cell_size, snapshot.size, width, height),
         cursor,
         info,
         hud_top: format!("tick {}  pop {}", snapshot.tick, snapshot.population),
@@ -1128,17 +1254,18 @@ fn draw_snapshot(canvas: &mut Canvas, context: &mut RenderContext) {
     // 6. рамка банки и внутренняя тень
     draw_jar_frame(canvas, offset_x, offset_y, grid, palette);
 
-    // 7. указатель мыши и курсор
-    if let Some(hover) = context.hover {
-        draw_hover(canvas, hover, cell, offset_x, offset_y, palette);
+    // 7. курсор: пока поле помещается в окно, выделения нет
+    if context.selection_active {
+        draw_cursor(canvas, context, offset_x, offset_y, cell);
     }
-    draw_cursor(canvas, context, offset_x, offset_y, cell);
 
     // 8. оверлеи интерфейса
     draw_minimap(canvas, context, offset_x, offset_y, cell);
     draw_hud(canvas, context);
     draw_legend(canvas, context);
-    draw_inspector(canvas, context);
+    if context.selection_active {
+        draw_inspector(canvas, context);
+    }
 }
 
 /// Рисует содержимое клеток поля.
@@ -1419,24 +1546,6 @@ fn draw_cursor(
         arm,
         color,
     );
-}
-
-/// Кольцо под указателем мыши.
-fn draw_hover(
-    canvas: &mut Canvas,
-    hover: (usize, usize),
-    cell: u32,
-    offset_x: i64,
-    offset_y: i64,
-    palette: &Palette,
-) {
-    let px = offset_x + (hover.0 as u32 * cell) as i64;
-    let py = offset_y + (hover.1 as u32 * cell) as i64;
-
-    canvas.fill_rect(px, py, cell, 1, palette.hover);
-    canvas.fill_rect(px, py + cell as i64 - 1, cell, 1, palette.hover);
-    canvas.fill_rect(px, py, 1, cell, palette.hover);
-    canvas.fill_rect(px + cell as i64 - 1, py, 1, cell, palette.hover);
 }
 
 /// Оверлей освещенности.
@@ -2635,6 +2744,145 @@ mod tests {
             snapshot.actions.iter().any(Option::is_some),
             "после тиков не записано ни одного действия"
         );
+    }
+
+    #[test]
+    fn field_fits_only_when_the_grid_fits_in_both_axes() {
+        assert!(field_fits(8, 100, 800, 800), "поле ровно в окне");
+        assert!(!field_fits(8, 100, 799, 800), "поле шире окна");
+        assert!(!field_fits(8, 100, 800, 799), "поле выше окна");
+        assert!(!field_fits(9, 100, 800, 800), "поле не влезает");
+    }
+
+    #[test]
+    fn selection_exists_only_when_the_field_does_not_fit() {
+        let mut app = App::new(Jar::new(20));
+        app.window_size = (800, 800);
+
+        app.cell_size = 8;
+        assert!(
+            !app.selection_active(),
+            "поле помещается, выделения быть не должно"
+        );
+
+        app.cell_size = 64;
+        assert!(
+            app.selection_active(),
+            "поле не помещается, выделение нужно"
+        );
+    }
+
+    #[test]
+    fn selection_moves_by_exactly_one_cell() {
+        let mut app = App::new(Jar::new(20));
+        app.window_size = (800, 800);
+        app.cell_size = 64;
+        app.cursor_x = 10;
+        app.cursor_y = 10;
+
+        app.move_selection(Direction::Right);
+        assert_eq!((app.cursor_x, app.cursor_y), (11, 10));
+
+        app.move_selection(Direction::Up);
+        assert_eq!((app.cursor_x, app.cursor_y), (11, 9));
+    }
+
+    #[test]
+    fn selection_does_not_move_when_the_field_fits() {
+        let mut app = App::new(Jar::new(20));
+        app.window_size = (800, 800);
+        app.cell_size = 8;
+        app.cursor_x = 10;
+        app.cursor_y = 10;
+
+        app.move_selection(Direction::Right);
+        assert_eq!((app.cursor_x, app.cursor_y), (10, 10));
+    }
+
+    #[test]
+    fn selection_stops_at_the_field_border() {
+        let mut app = App::new(Jar::new(20));
+        app.window_size = (800, 800);
+        app.cell_size = 64;
+
+        app.cursor_x = 0;
+        app.cursor_y = 0;
+        app.move_selection(Direction::Left);
+        app.move_selection(Direction::Up);
+        assert_eq!((app.cursor_x, app.cursor_y), (0, 0));
+
+        app.cursor_x = 19;
+        app.cursor_y = 19;
+        app.move_selection(Direction::Right);
+        app.move_selection(Direction::Down);
+        assert_eq!((app.cursor_x, app.cursor_y), (19, 19));
+    }
+
+    #[test]
+    fn zoom_in_creates_selection_in_the_center_of_the_view() {
+        let mut app = App::new(Jar::new(20));
+        app.window_size = (800, 800);
+        app.cell_size = 8;
+        app.fit_cell_size = 8;
+        assert!(!app.selection_active());
+
+        app.set_cell_size(64);
+
+        assert!(app.selection_active());
+        assert_eq!(
+            (app.cursor_x, app.cursor_y),
+            (10, 10),
+            "выделение должно появиться в центре вида"
+        );
+    }
+
+    #[test]
+    fn repeat_interval_accelerates_and_stops_at_the_limit() {
+        let start = repeat_interval(Duration::ZERO);
+        assert_eq!(start, REPEAT_INTERVAL_START);
+
+        let faster = repeat_interval(Duration::from_millis(500));
+        assert!(faster < start, "интервал не ускорился");
+
+        let fastest = repeat_interval(Duration::from_secs(10));
+        assert_eq!(fastest, REPEAT_INTERVAL_MIN);
+    }
+
+    #[test]
+    fn press_moves_once_and_repeat_takes_over_later() {
+        let mut app = App::new(Jar::new(20));
+        app.window_size = (800, 800);
+        app.cell_size = 64;
+        app.cursor_x = 10;
+
+        let now = Instant::now();
+        app.press_direction(Direction::Right);
+        assert_eq!(app.cursor_x, 11, "нажатие должно сдвинуть на одну клетку");
+        assert!(app.hold.is_some());
+
+        // До истечения задержки автоповтора ничего не происходит.
+        app.update_repeat(now);
+        assert_eq!(app.cursor_x, 11);
+
+        // После задержки выделение едет само.
+        app.update_repeat(now + REPEAT_DELAY + Duration::from_millis(1));
+        assert_eq!(app.cursor_x, 12);
+
+        app.release_direction();
+        assert!(app.hold.is_none());
+    }
+
+    #[test]
+    fn direction_is_recognized_by_key() {
+        assert_eq!(
+            Direction::from_key(PhysicalKey::Code(KeyCode::KeyW)),
+            Some(Direction::Up)
+        );
+        assert_eq!(
+            Direction::from_key(PhysicalKey::Code(KeyCode::ArrowRight)),
+            Some(Direction::Right)
+        );
+        assert_eq!(Direction::from_key(PhysicalKey::Code(KeyCode::Space)), None);
     }
 
     #[test]
