@@ -36,14 +36,18 @@ const REPEAT_DELAY: Duration = Duration::from_millis(180);
 const REPEAT_INTERVAL_START: Duration = Duration::from_millis(45);
 /// Минимальный интервал автоповтора: предельная скорость перемещения.
 const REPEAT_INTERVAL_MIN: Duration = Duration::from_millis(12);
-/// Сколько тиков живет клетка, после чего умирает.
+/// Нижняя граница срока жизни клетки в тиках.
+const CREATURE_LIFETIME_MIN_TICKS: usize = 900;
+/// Верхняя граница срока жизни клетки в тиках.
+const CREATURE_LIFETIME_MAX_TICKS: usize = 1100;
+/// Срок жизни по умолчанию: используется, когда клетку создают напрямую.
 const CREATURE_LIFETIME_TICKS: usize = 1000;
 /// Максимальный прирост энергии от фотосинтеза за тик (у самого края).
 const MAX_PHOTOSYNTHESIS_ENERGY: usize = 4;
 /// Сколько энергии тратит поедание одного минерала.
 const EAT_MINERALS_ENERGY_COST: usize = 1;
 /// Шанс мутации генома при делении, в процентах (для каждой дочерней клетки).
-const MUTATION_CHANCE_PERCENT: u64 = 5;
+const MUTATION_CHANCE_PERCENT: u64 = 1;
 /// Максимальная скорость: столько тиков за кадр.
 const MAX_SPEED: u32 = u32::MAX;
 /// Максимальное замедление: один тик раз в столько кадров.
@@ -58,6 +62,23 @@ const SPLIT_MINERALS: usize = 10;
 const SPLIT_ENERGY_SHARE_PERCENT: usize = 40;
 /// Сколько минералов изначально лежит в каждой клетке поля.
 const INITIAL_MINERALS: usize = 100;
+/// Сколько энергии клетка отдает случайному соседу за один ген Share.
+const SHARE_AMOUNT: usize = 8;
+/// Сколько энергии стоит одна атака.
+const ATTACK_COST: usize = 2;
+/// Сколько энергии снимает одна атака с жертвы.
+///
+/// Урон больше цены: нападающий тратит меньше, чем отнимает, но война
+/// все равно идет на истощение - у каждой стороны свой фотосинтез.
+const ATTACK_DAMAGE: usize = 4;
+/// Порог энергии для условия LowEnergy гена JumpIf.
+const LOW_ENERGY: usize = 30;
+/// Минимальная схожесть состава ДНК, при которой сосед считается своим.
+///
+/// Мутировавший ребенок отдален от матери на один ген (~94%), поэтому
+/// он остается своим; кластеры с разных краев банки различаются сильно
+/// (~60-70%) и считаются чужими - на их стыке начинается война.
+const KIN_SIMILARITY_PERCENT: u32 = 80;
 
 /// Насколько сильно вспышка рождения или смерти перекрывает клетку.
 const FLASH_STRENGTH: u32 = 200;
@@ -148,6 +169,9 @@ impl Palette {
                 0x002C_74C4, // EatMinerals
                 0x00E8_590C, // Split
                 0x00C2_255C, // Jump
+                0x00F2_B33D, // Share
+                0x00D6_2B2B, // Attack
+                0x000E_A5A5, // JumpIf
             ],
         }
     }
@@ -202,11 +226,25 @@ pub enum ActionKind {
     Split,
     /// Прыжок: указатель ДНК сдвигается на дополнительное число.
     Jump,
+    /// Щедрость: клетка отдает энергию случайному соседу.
+    Share,
+    /// Атака: клетка снимает энергию с соседа, а при нуле - убивает его.
+    Attack,
+    /// Условный прыжок: сдвиг по ДНК, только если выполнено условие.
+    JumpIf,
 }
 
 impl ActionKind {
     /// Все типы генов. Порядок задает индексы в палитре и в составе генома.
-    pub const ALL: [ActionKind; 4] = [Self::PhotoGrow, Self::EatMinerals, Self::Split, Self::Jump];
+    pub const ALL: [ActionKind; 7] = [
+        Self::PhotoGrow,
+        Self::EatMinerals,
+        Self::Split,
+        Self::Jump,
+        Self::Share,
+        Self::Attack,
+        Self::JumpIf,
+    ];
 
     /// Сколько всего типов генов.
     pub const COUNT: usize = Self::ALL.len();
@@ -218,6 +256,9 @@ impl ActionKind {
             Self::EatMinerals => 1,
             Self::Split => 2,
             Self::Jump => 3,
+            Self::Share => 4,
+            Self::Attack => 5,
+            Self::JumpIf => 6,
         }
     }
 
@@ -228,6 +269,9 @@ impl ActionKind {
             Self::EatMinerals => "eat",
             Self::Split => "split",
             Self::Jump => "jump",
+            Self::Share => "share",
+            Self::Attack => "atk",
+            Self::JumpIf => "jif",
         }
     }
 
@@ -238,6 +282,65 @@ impl ActionKind {
             Self::EatMinerals => 240.0,
             Self::Split => 0.0,
             Self::Jump => 300.0,
+            Self::Share => 45.0,
+            Self::Attack => 350.0,
+            Self::JumpIf => 180.0,
+        }
+    }
+}
+
+/// Условие гена [`CreatureAction::JumpIf`]: что должно быть верным,
+/// чтобы указатель ДНК действительно сдвинулся.
+///
+/// Условие считается по соседям клетки, поэтому оно и порождает
+/// разделение на "своих" и "чужих": клетка сама решает, делиться
+/// ей или бить, глядя на геномы вокруг.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum KinCondition {
+    /// Рядом есть клетка с похожей ДНК.
+    HasKin,
+    /// Рядом нет клеток с похожей ДНК.
+    NoKin,
+    /// Рядом есть клетка с чужой ДНК.
+    HasFoe,
+    /// Рядом нет клеток с чужой ДНК.
+    NoFoe,
+    /// У самой клетки мало энергии.
+    LowEnergy,
+}
+
+impl KinCondition {
+    /// Все условия. Порядок задает индексы при мутации.
+    pub const ALL: [KinCondition; 5] = [
+        Self::HasKin,
+        Self::NoKin,
+        Self::HasFoe,
+        Self::NoFoe,
+        Self::LowEnergy,
+    ];
+
+    /// Сколько всего условий.
+    pub const COUNT: usize = Self::ALL.len();
+
+    /// Короткое имя условия.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::HasKin => "kin",
+            Self::NoKin => "nokin",
+            Self::HasFoe => "foe",
+            Self::NoFoe => "nofoe",
+            Self::LowEnergy => "low",
+        }
+    }
+
+    /// Следующее условие по кругу: так мутация не оставляет условие прежним.
+    pub const fn next(self) -> Self {
+        match self {
+            Self::HasKin => Self::NoKin,
+            Self::NoKin => Self::HasFoe,
+            Self::HasFoe => Self::NoFoe,
+            Self::NoFoe => Self::LowEnergy,
+            Self::LowEnergy => Self::HasKin,
         }
     }
 }
@@ -253,6 +356,12 @@ pub enum CreatureAction {
     EatMinerals,
     /// Сдвинуть указатель ДНК на X (вдобавок к обычному +1).
     Jump(isize),
+    /// Отдать часть энергии случайному соседу.
+    Share,
+    /// Снять энергию с случайного соседа; при нуле - убить его.
+    Attack,
+    /// Сдвинуть указатель ДНК на X, только если выполнено условие.
+    JumpIf(KinCondition, isize),
 }
 
 impl CreatureAction {
@@ -263,6 +372,21 @@ impl CreatureAction {
             CreatureAction::PhotoGrow => ActionKind::PhotoGrow,
             CreatureAction::EatMinerals => ActionKind::EatMinerals,
             CreatureAction::Jump(_) => ActionKind::Jump,
+            CreatureAction::Share => ActionKind::Share,
+            CreatureAction::Attack => ActionKind::Attack,
+            CreatureAction::JumpIf(_, _) => ActionKind::JumpIf,
+        }
+    }
+
+    /// Дельта прыжка, если у действия есть параметр сдвига.
+    ///
+    /// Условный прыжок сдвигает указатель ровно так же, как обычный:
+    /// разница только в том, срабатывает ли сдвиг вообще.
+    pub fn jump_delta(self) -> Option<isize> {
+        match self {
+            CreatureAction::Jump(delta) => Some(delta),
+            CreatureAction::JumpIf(_, delta) => Some(delta),
+            _ => None,
         }
     }
 }
@@ -272,8 +396,8 @@ impl CreatureAction {
 pub enum MutationKind {
     /// Вставить новый ген.
     Insert,
-    /// Изменить значение гена Jump.
-    Jump,
+    /// Изменить параметр гена: дельту прыжка или условие условного прыжка.
+    Value,
     /// Удалить ген.
     Remove,
     /// Заменить ген на другой.
@@ -282,7 +406,7 @@ pub enum MutationKind {
 
 impl MutationKind {
     /// Все способы мутации.
-    pub const ALL: [MutationKind; 4] = [Self::Insert, Self::Jump, Self::Remove, Self::Replace];
+    pub const ALL: [MutationKind; 4] = [Self::Insert, Self::Value, Self::Remove, Self::Replace];
 }
 
 // ===========================================================================
@@ -340,7 +464,18 @@ pub fn random_action(rng: &mut Rng) -> CreatureAction {
         ActionKind::EatMinerals => CreatureAction::EatMinerals,
         ActionKind::Split => CreatureAction::Split,
         ActionKind::Jump => CreatureAction::Jump(random_jump_delta(rng)),
+        ActionKind::Share => CreatureAction::Share,
+        ActionKind::Attack => CreatureAction::Attack,
+        ActionKind::JumpIf => CreatureAction::JumpIf(
+            KinCondition::ALL[rng.below(KinCondition::COUNT)],
+            random_jump_delta(rng),
+        ),
     }
+}
+
+/// Случайное условие для гена JumpIf.
+pub fn random_condition(rng: &mut Rng) -> KinCondition {
+    KinCondition::ALL[rng.below(KinCondition::COUNT)]
 }
 
 /// Случайное ненулевое значение для гена Jump.
@@ -350,6 +485,25 @@ pub fn random_action(rng: &mut Rng) -> CreatureAction {
 pub fn random_jump_delta(rng: &mut Rng) -> isize {
     let delta = rng.below(8) as isize - 4;
     if delta >= 0 { delta + 1 } else { delta }
+}
+
+/// Новое значение дельты прыжка: текущее значение, сдвинутое на случайную
+/// величину и зажатое в диапазон -4..=4 без нуля.
+///
+/// Если зажатие свело сдвиг к нулю или к прежнему значению, мутация
+/// меняет знак: она обязана что-то менять.
+fn new_jump_value(current: isize, rng: &mut Rng) -> isize {
+    let mut next = current + random_jump_delta(rng);
+    if next == 0 {
+        // Нулевой прыжок бессмысленен: оставляем направление прежним.
+        next = if current < 0 { -1 } else { 1 };
+    }
+    next = next.clamp(-4, 4);
+    if next == current {
+        // Мутация обязана что-то менять: если не вышло - меняем знак.
+        next = -current;
+    }
+    next
 }
 
 // ===========================================================================
@@ -429,8 +583,10 @@ impl Grid {
 /// деление, не затрагивая код правил.
 #[derive(Clone, Copy, Debug)]
 pub struct Config {
-    /// Сколько тиков живет клетка, после чего умирает.
-    pub lifetime_ticks: usize,
+    /// Нижняя граница случайного срока жизни клетки.
+    pub lifetime_min_ticks: usize,
+    /// Верхняя граница случайного срока жизни клетки.
+    pub lifetime_max_ticks: usize,
     /// Максимальный прирост энергии от фотосинтеза за тик.
     pub max_photosynthesis_energy: usize,
     /// Сколько энергии тратит поедание одного минерала.
@@ -452,7 +608,8 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            lifetime_ticks: CREATURE_LIFETIME_TICKS,
+            lifetime_min_ticks: CREATURE_LIFETIME_MIN_TICKS,
+            lifetime_max_ticks: CREATURE_LIFETIME_MAX_TICKS,
             max_photosynthesis_energy: MAX_PHOTOSYNTHESIS_ENERGY,
             eat_minerals_energy_cost: EAT_MINERALS_ENERGY_COST,
             mutation_chance_percent: MUTATION_CHANCE_PERCENT,
@@ -463,6 +620,16 @@ impl Default for Config {
             genome_len: GENOME_LEN,
         }
     }
+}
+
+/// Случайный срок жизни клетки: от нижней до верхней границы из настроек.
+///
+/// Разброс нужен, чтобы целые поколения не умирали в один и тот же тик:
+/// смерть волной иначе снова превращается в регулярные кольца.
+fn random_lifespan(rng: &mut Rng, config: &Config) -> usize {
+    let min = config.lifetime_min_ticks;
+    let max = config.lifetime_max_ticks.max(min);
+    min + rng.below(max - min + 1)
 }
 
 // ===========================================================================
@@ -478,6 +645,9 @@ pub struct CreatureGenome {
     pub line_pointer: usize,
     /// Цвет генома: кешируется, потому что считается из 16 оттенков.
     color: u32,
+    /// Доли генов каждого типа: кешируются, потому что считаются
+    /// с сортировкой остатков, а нужны при каждом взаимодействии с соседом.
+    mix: [u8; ActionKind::COUNT],
 }
 
 impl CreatureGenome {
@@ -511,10 +681,12 @@ impl CreatureGenome {
         assert!(!line.is_empty(), "геном не может быть пустым");
 
         let color = compute_genome_color(&line);
+        let mix = compute_mix(&line);
         Self {
             line,
             line_pointer: 0,
             color,
+            mix,
         }
     }
 
@@ -548,6 +720,20 @@ impl CreatureGenome {
         self.color
     }
 
+    /// Доли генов каждого типа: по ним считается сходство с соседями.
+    pub fn mix(&self) -> [u8; ActionKind::COUNT] {
+        self.mix
+    }
+
+    /// Сходство этого генома с другим: 100 - одинаковый состав ДНК.
+    ///
+    /// Мера не смотрит на порядок генов, поэтому вставка, удаление
+    /// и перестановка не делают клетку чужой - только замены генов,
+    /// накопленные поколениями, постепенно отдаляют потомка от родичей.
+    pub fn similarity_to(&self, other: &CreatureGenome) -> u32 {
+        kin_similarity(&self.mix, &other.mix)
+    }
+
     /// Копия генома с измененными генами: `(позиция, ген)`.
     ///
     /// Удобно собирать варианты геномов, не лезя внутрь нити.
@@ -558,7 +744,7 @@ impl CreatureGenome {
                 genome.line[index] = action;
             }
         }
-        genome.recompute_color();
+        genome.recompute_caches();
         genome
     }
 
@@ -583,9 +769,10 @@ impl CreatureGenome {
                 let index = rng.below(self.line.len() + 1);
                 self.line.insert(index, random_action(rng));
             }
-            MutationKind::Jump => {
-                // Изменение значения Jump; если Jump нет — обычная замена гена.
-                if !self.mutate_jump_value(rng) {
+            MutationKind::Value => {
+                // Изменение параметра гена; если параметрических генов нет -
+                // обычная замена гена.
+                if !self.mutate_value(rng) {
                     self.replace_gene(rng);
                 }
             }
@@ -601,7 +788,7 @@ impl CreatureGenome {
             MutationKind::Replace => self.replace_gene(rng),
         }
 
-        self.recompute_color();
+        self.recompute_caches();
     }
 
     /// Заменяет случайный ген на случайный другой.
@@ -610,45 +797,51 @@ impl CreatureGenome {
         self.line[index] = random_action(rng);
     }
 
-    /// Изменяет значение случайного гена Jump. Возвращает `false`, если Jump нет.
+    /// Изменяет параметр случайного параметрического гена.
     ///
-    /// Новое значение остается в диапазоне -4..=4 и никогда не равно нулю:
-    /// ген прыжка всегда что-то сдвигает.
-    fn mutate_jump_value(&mut self, rng: &mut Rng) -> bool {
-        let jump_positions: Vec<usize> = self
+    /// Параметрические гены - `Jump` и `JumpIf`: у них есть дельта сдвига,
+    /// а у `JumpIf` еще и условие. Возвращает `false`, если такого гена нет.
+    ///
+    /// Новое значение дельты остается в диапазоне -4..=4 и никогда не равно
+    /// нулю: ген прыжка всегда что-то сдвигает.
+    fn mutate_value(&mut self, rng: &mut Rng) -> bool {
+        let positions: Vec<usize> = self
             .line
             .iter()
             .enumerate()
-            .filter_map(|(index, action)| {
-                matches!(action, CreatureAction::Jump(_)).then_some(index)
-            })
+            .filter_map(|(index, action)| action.jump_delta().map(|_| index))
             .collect();
 
-        if jump_positions.is_empty() {
+        if positions.is_empty() {
             return false;
         }
 
-        let index = jump_positions[rng.below(jump_positions.len())];
-        if let CreatureAction::Jump(value) = &mut self.line[index] {
-            let mut next = *value + random_jump_delta(rng);
-            if next == 0 {
-                // Нулевой прыжок бессмысленен: оставляем направление прежним.
-                next = if *value < 0 { -1 } else { 1 };
+        let index = positions[rng.below(positions.len())];
+        match &mut self.line[index] {
+            CreatureAction::Jump(value) => {
+                *value = new_jump_value(*value, rng);
             }
-            next = next.clamp(-4, 4);
-            if next == *value {
-                // Мутация обязана что-то менять: если не вышло — меняем знак.
-                next = -*value;
+            CreatureAction::JumpIf(condition, value) => {
+                // Половина мутаций меняет сдвиг, половина - условие:
+                // так геном учится иначе реагировать на соседей.
+                if rng.below(2) == 0 {
+                    *value = new_jump_value(*value, rng);
+                } else {
+                    // Мутация обязана что-то менять: условие сдвигается
+                    // на следующее по кругу.
+                    *condition = condition.next();
+                }
             }
-            *value = next;
+            _ => return false,
         }
 
         true
     }
 
-    /// Пересчитывает кешированный цвет генома.
-    fn recompute_color(&mut self) {
+    /// Пересчитывает кешированные цвет и состав генома.
+    fn recompute_caches(&mut self) {
         self.color = compute_genome_color(&self.line);
+        self.mix = compute_mix(&self.line);
     }
 
     /// Выдает текущее действие клетки, сдвигает указатель действия на следующий
@@ -674,6 +867,8 @@ pub struct Creature {
     pub minerals: usize,
     /// Возраст клетки в тиках.
     pub age: usize,
+    /// Возраст, в котором клетка умрет: задается случайно при рождении.
+    pub lifespan: usize,
     /// Последнее выполненное действие: нужно для режима просмотра `action`.
     pub last_action: Option<CreatureAction>,
 }
@@ -686,6 +881,7 @@ impl Creature {
             energy: 0,
             minerals: 0,
             age: 0,
+            lifespan: CREATURE_LIFETIME_TICKS,
             last_action: None,
         }
     }
@@ -707,10 +903,12 @@ impl Creature {
         let mut c_0 = Creature::new(self.genome.clone());
         c_0.energy = energy;
         c_0.minerals = m_0;
+        c_0.lifespan = random_lifespan(rng, config);
 
         let mut c_1 = Creature::new(self.genome.clone());
         c_1.energy = energy;
         c_1.minerals = m_1;
+        c_1.lifespan = random_lifespan(rng, config);
 
         // Дети начинают ДНК с начала: указатель матери продолжает свой.
         c_0.genome.set_pointer(0);
@@ -735,8 +933,6 @@ impl Creature {
 enum Fate {
     /// Клетка остается на месте.
     Stay(Creature),
-    /// Клетка умерла: минералы возвращаются в поле.
-    Die(Creature),
     /// Клетка разделилась: мать остается здесь, ребенок идет в `at`.
     Divide {
         /// Мать, остающаяся на своей клетке.
@@ -809,6 +1005,23 @@ impl Jar {
         }
     }
 
+    /// Случайная свободная клетка поля.
+    ///
+    /// Если случайные попытки не нашли пустую клетку (поле почти
+    /// забито), берётся первая свободная.
+    fn random_free_index(&mut self) -> usize {
+        for _ in 0..100 {
+            let index = self.rng.below(self.creatures.len());
+            if self.creatures[index].is_none() {
+                return index;
+            }
+        }
+
+        (0..self.creatures.len())
+            .find(|&index| self.creatures[index].is_none())
+            .unwrap_or(0)
+    }
+
     /// Создает снимок состояния мира для отрисовки.
     pub fn snapshot(&self) -> JarSnapshot {
         let mut snapshot = JarSnapshot::new(self.size);
@@ -873,7 +1086,7 @@ impl Jar {
 
             creature.age += 1;
 
-            if creature.age >= self.config.lifetime_ticks {
+            if creature.age >= creature.lifespan {
                 // Клетка прожила свой срок - умирает, а все ее минералы
                 // возвращаются обратно на карту.
                 self.minerals[index] += creature.minerals;
@@ -886,11 +1099,6 @@ impl Jar {
 
             match self.act(creature, action, index, &grid) {
                 Fate::Stay(creature) => self.creatures[index] = Some(creature),
-                Fate::Die(creature) => {
-                    // Некуда делиться - клетка умирает, а все ее минералы
-                    // возвращаются обратно на карту.
-                    self.minerals[index] += creature.minerals;
-                }
                 Fate::Divide { mother, child, at } => {
                     self.creatures[index] = Some(mother);
                     self.reserved[at] = true;
@@ -920,7 +1128,7 @@ impl Jar {
             None => true,
             // Сосед еще не жил в этом тике: если он доживет до конца
             // тика, место занято.
-            Some(creature) => neighbor > index && creature.age + 1 >= self.config.lifetime_ticks,
+            Some(creature) => neighbor > index && creature.age + 1 >= creature.lifespan,
         }
     }
 
@@ -966,7 +1174,11 @@ impl Jar {
                 }
 
                 if free.is_empty() {
-                    return Fate::Die(creature);
+                    // Делиться некуда: клетка остается на месте и спокойно
+                    // выполняет остальные свои гены. Энергия не копится выше
+                    // порога деления, иначе зажатая клетка копит ее бесконечно.
+                    creature.energy = self.config.split_energy;
+                    return Fate::Stay(creature);
                 }
 
                 let at = free[self.rng.below(free.len())];
@@ -979,6 +1191,122 @@ impl Jar {
                 creature.genome.jump(delta);
                 Fate::Stay(creature)
             }
+            CreatureAction::Share => {
+                // Делиться можно только с кем-то и только имея что.
+                let Some(target) = self.random_neighbor(index, grid) else {
+                    return Fate::Stay(creature);
+                };
+
+                let amount = creature.energy.min(SHARE_AMOUNT);
+                if amount == 0 {
+                    return Fate::Stay(creature);
+                }
+
+                creature.energy -= amount;
+                if let Some(neighbour) = self.creatures[target].as_mut() {
+                    neighbour.energy += amount;
+                }
+                Fate::Stay(creature)
+            }
+            CreatureAction::Attack => {
+                // Бить можно только с кем-то и только имея чем платить.
+                if creature.energy < ATTACK_COST {
+                    return Fate::Stay(creature);
+                }
+                let Some(target) = self.random_neighbor(index, grid) else {
+                    return Fate::Stay(creature);
+                };
+
+                creature.energy -= ATTACK_COST;
+                self.strike(target, ATTACK_DAMAGE);
+                Fate::Stay(creature)
+            }
+            CreatureAction::JumpIf(condition, delta) => {
+                // Условие читает соседей: это единственный способ в ДНК
+                // отличить своего от чужого и среагировать на голод.
+                if self.condition_holds(condition, &creature, index, grid) {
+                    creature.genome.jump(delta);
+                }
+                Fate::Stay(creature)
+            }
+        }
+    }
+
+    /// Случайная живая клетка среди соседей `index`; `None`, если соседей нет.
+    ///
+    /// Порядок обхода и номера клеток на выбор не влияют: всегда берется
+    /// один из равных кандидатов.
+    fn random_neighbor(&mut self, index: usize, grid: &Grid) -> Option<usize> {
+        let alive: Vec<usize> = grid
+            .neighbors4(index)
+            .filter(|&neighbor| self.creatures[neighbor].is_some())
+            .collect();
+
+        if alive.is_empty() {
+            return None;
+        }
+
+        Some(alive[self.rng.below(alive.len())])
+    }
+
+    /// Снимает с жертвы энергию; при нуле жертва погибает.
+    ///
+    /// Жертва может быть еще не обойдена этим тиком или уже обойдена -
+    /// в обоих случаях она лежит в `creatures`, а основной цикл просто
+    /// не найдет ее, если она выброшена. Новорожденных в `creatures`
+    /// еще нет, поэтому конфликтов с `reserved` не бывает.
+    fn strike(&mut self, target: usize, damage: usize) {
+        let Some(mut victim) = self.creatures[target].take() else {
+            return;
+        };
+
+        if victim.energy > damage {
+            victim.energy -= damage;
+            self.creatures[target] = Some(victim);
+            return;
+        }
+
+        // Энергия кончилась: клетка умирает и возвращает минералы в поле.
+        self.minerals[target] += victim.minerals;
+    }
+
+    /// Выполняет ли клетка условие `condition`, стоя на клетке `index`.
+    ///
+    /// Условия про соседей читаются целиком: `NoKin` и `NoFoe` - это
+    /// отрицания `HasKin` и `HasFoe`, поэтому у одинокой клетки и то,
+    /// и другое истинно.
+    fn condition_holds(
+        &self,
+        condition: KinCondition,
+        creature: &Creature,
+        index: usize,
+        grid: &Grid,
+    ) -> bool {
+        if condition == KinCondition::LowEnergy {
+            return creature.energy < LOW_ENERGY;
+        }
+
+        let mine = creature.genome.mix();
+        let (mut has_kin, mut has_foe) = (false, false);
+
+        for neighbor in grid.neighbors4(index) {
+            let Some(other) = self.creatures[neighbor].as_ref() else {
+                continue;
+            };
+
+            if kin_similarity(&mine, &other.genome.mix()) >= KIN_SIMILARITY_PERCENT {
+                has_kin = true;
+            } else {
+                has_foe = true;
+            }
+        }
+
+        match condition {
+            KinCondition::HasKin => has_kin,
+            KinCondition::NoKin => !has_kin,
+            KinCondition::HasFoe => has_foe,
+            KinCondition::NoFoe => !has_foe,
+            KinCondition::LowEnergy => false,
         }
     }
 
@@ -1079,8 +1407,13 @@ impl JarSnapshot {
 /// Сумма долей всегда равна 255, поэтому полоска состава генома
 /// заполняет клетку целиком.
 pub fn genome_mix(genome: &CreatureGenome) -> [u8; ActionKind::COUNT] {
+    genome.mix()
+}
+
+/// Считает доли генов каждого типа по нити ДНК.
+fn compute_mix(line: &[CreatureAction]) -> [u8; ActionKind::COUNT] {
     let mut counts = [0u32; ActionKind::COUNT];
-    for action in genome.genes() {
+    for action in line {
         counts[action.kind().index()] += 1;
     }
 
@@ -1118,6 +1451,24 @@ pub fn genome_mix(genome: &CreatureGenome) -> [u8; ActionKind::COUNT] {
     }
 
     mix
+}
+
+/// Сходство двух составов ДНК: 100 - полностью одинаковые, 0 - никакой
+/// общей структуры.
+///
+/// Сравниваются доли типов генов, поэтому порядок и позиции не важны:
+/// вставка, удаление и перестановка гена не меняют сходство, а каждая
+/// замена гена отдаляет клетку от родичей примерно на 6 процентов.
+pub fn kin_similarity(left: &[u8; ActionKind::COUNT], right: &[u8; ActionKind::COUNT]) -> u32 {
+    // Максимум разницы - 510: весь один геном в одном типе генов,
+    // весь другой - в другом (255 + 255).
+    let difference: u32 = left
+        .iter()
+        .zip(right.iter())
+        .map(|(a, b)| a.abs_diff(*b) as u32)
+        .sum();
+
+    100 - difference * 100 / 510
 }
 
 /// Цвет генома: взвешенная циркулярная средняя оттенков генов.
@@ -1224,68 +1575,101 @@ pub fn apply_jump(pointer: usize, delta: isize) -> usize {
 // Стартовые геномы
 // ===========================================================================
 
-/// Стандартный геном: верхний край.
-pub(crate) fn genome_top() -> CreatureGenome {
-    CreatureGenome::standard()
+/// Базовый геном: восемь генов, повторённых дважды.
+///
+/// Он одинаков у всех четырёх колоний: никакого готового поведения
+/// в нём не зашито. Клетка умеет делиться энергией (`Share`), бить
+/// соседа (`Attack`) и сдвигать указатель по ДНК, если голодна
+/// (`JumpIf` с условием `LowEnergy`).
+///
+/// Всё остальное - условия гена `JumpIf`, порядок генов, их количество -
+/// появляется само, в ходе мутаций. Именно поэтому у соседей
+/// появляется привычка бить только чужих, а делиться - только своими.
+pub(crate) fn genome_base() -> CreatureGenome {
+    CreatureGenome::from_line(vec![
+        CreatureAction::PhotoGrow,
+        CreatureAction::PhotoGrow,
+        CreatureAction::EatMinerals,
+        CreatureAction::Split,
+        CreatureAction::Share,
+        CreatureAction::JumpIf(KinCondition::LowEnergy, 1),
+        CreatureAction::Attack,
+        CreatureAction::PhotoGrow,
+        CreatureAction::PhotoGrow,
+        CreatureAction::PhotoGrow,
+        CreatureAction::EatMinerals,
+        CreatureAction::Split,
+        CreatureAction::Share,
+        CreatureAction::JumpIf(KinCondition::LowEnergy, 1),
+        CreatureAction::Attack,
+        CreatureAction::PhotoGrow,
+    ])
 }
 
-/// Прыжки по ДНК вместо части делений: правый край.
+/// Верхний край: щедрый.
+///
+/// Отличий от базы одно: ещё один ген `Share`. Дальше всё решает
+/// эволюция - либо щедрость закрепится, либо мутации её съедают.
+pub(crate) fn genome_top() -> CreatureGenome {
+    genome_base().with_genes(&[(8, CreatureAction::Share)])
+}
+
+/// Прыжки по ДНК: правый край.
+///
+/// Отличий от базы одно: ген `Jump`. Он сдвигает указатель и тем самым
+/// меняет то, какие гены клетка исполняет по кругу.
 pub(crate) fn genome_right() -> CreatureGenome {
-    CreatureGenome::standard().with_genes(&[
-        (3, CreatureAction::Jump(1)),
-        (7, CreatureAction::Jump(2)),
-        (11, CreatureAction::Jump(1)),
-    ])
+    genome_base().with_genes(&[(8, CreatureAction::Jump(1))])
 }
 
 /// Больше поедания минералов: нижний край.
+///
+/// Отличий от базы одно: ещё один ген `EatMinerals`.
 pub(crate) fn genome_bottom() -> CreatureGenome {
-    CreatureGenome::standard().with_genes(&[
-        (4, CreatureAction::EatMinerals),
-        (8, CreatureAction::EatMinerals),
-    ])
+    genome_base().with_genes(&[(8, CreatureAction::EatMinerals)])
 }
 
-/// Больше делений: левый край.
+/// Чаще делится: левый край.
+///
+/// Отличий от базы одно: ещё один ген `Split`.
 pub(crate) fn genome_left() -> CreatureGenome {
-    CreatureGenome::standard().with_genes(&[(2, CreatureAction::Split), (6, CreatureAction::Split)])
+    genome_base().with_genes(&[(8, CreatureAction::Split)])
 }
 
 /// Размещает одинаковые геномы в указанных клетках поля.
+#[cfg(test)]
 fn spawn(jar: &mut Jar, genome: &CreatureGenome, positions: &[(usize, usize)]) {
     let size = jar.size;
+    let config = jar.config;
     for &(x, y) in positions {
-        jar.creatures[x + y * size] = Some(Creature::new(genome.clone()));
+        let mut creature = Creature::new(genome.clone());
+        creature.lifespan = random_lifespan(&mut jar.rng, &config);
+        jar.creatures[x + y * size] = Some(creature);
     }
 }
 
-/// Создает Jar с четырьмя группами существ у разных краев.
+/// Создает Jar с четырьмя группами существ в случайных местах поля.
+///
+/// Стартовые позиции случайны: ничьи ниши нигде не заданы, колонии
+/// сами находят свет и сталкиваются друг с другом.
 pub(crate) fn seeded_jar() -> Jar {
     let mut jar = Jar::new(100);
-    let size = jar.size;
-    let mid = size / 2;
+    let config = jar.config;
 
-    // По три клетки на каждом краю, рядом с зоной максимального света.
-    spawn(
-        &mut jar,
-        &genome_top(),
-        &[(mid - 1, 2), (mid, 2), (mid + 1, 2)],
-    );
-    spawn(
-        &mut jar,
-        &genome_right(),
-        &[(size - 3, mid - 1), (size - 3, mid), (size - 3, mid + 1)],
-    );
-    spawn(
-        &mut jar,
-        &genome_bottom(),
-        &[(mid - 1, size - 3), (mid, size - 3), (mid + 1, size - 3)],
-    );
-    spawn(
-        &mut jar,
-        &genome_left(),
-        &[(2, mid - 1), (2, mid), (2, mid + 1)],
-    );
+    // По три клетки каждого вида: по двадцать четыре гена на банку.
+    for (genome, count) in [
+        (genome_top(), 3usize),
+        (genome_right(), 3),
+        (genome_bottom(), 3),
+        (genome_left(), 3),
+    ] {
+        for _ in 0..count {
+            let index = jar.random_free_index();
+            let mut creature = Creature::new(genome.clone());
+            creature.lifespan = random_lifespan(&mut jar.rng, &config);
+            jar.creatures[index] = Some(creature);
+        }
+    }
 
     jar
 }
@@ -3534,12 +3918,20 @@ mod tests {
 
     /// Проверяет базовые инварианты мира после серии тиков.
     fn assert_invariants(jar: &Jar, config: &Config) {
+        let max_lifespan = config.lifetime_max_ticks.max(config.lifetime_min_ticks);
         for creature in jar.creatures.iter().flatten() {
             assert!(
-                creature.age <= config.lifetime_ticks,
+                creature.lifespan >= config.lifetime_min_ticks && creature.lifespan <= max_lifespan,
+                "срок жизни {} вне диапазона {}..={}",
+                creature.lifespan,
+                config.lifetime_min_ticks,
+                max_lifespan
+            );
+            assert!(
+                creature.age <= creature.lifespan,
                 "возраст {} превысил срок жизни {}",
                 creature.age,
-                config.lifetime_ticks
+                creature.lifespan
             );
             assert!(
                 !creature.genome.is_empty(),
@@ -3596,11 +3988,13 @@ mod tests {
     #[test]
     fn creatures_die_at_the_end_of_their_lifetime() {
         let config = Config {
-            lifetime_ticks: 5,
+            lifetime_min_ticks: 5,
+            lifetime_max_ticks: 5,
             ..Config::default()
         };
         let mut jar = Jar::with_config_and_seed(10, config, 3);
         jar.creatures[0] = Some(Creature::new(genome_of(CreatureAction::PhotoGrow)));
+        jar.creatures[0].as_mut().unwrap().lifespan = 5;
 
         for _ in 0..4 {
             jar.simulation_step();
@@ -3611,6 +4005,29 @@ mod tests {
         assert!(
             jar.creatures[0].is_none(),
             "клетка прожила больше срока жизни"
+        );
+    }
+
+    #[test]
+    fn lifespan_is_random_within_the_configured_range() {
+        let config = Config::default();
+        let mut rng = Rng::new(17);
+        let mut seen_min = usize::MAX;
+        let mut seen_max = 0usize;
+
+        for _ in 0..2000 {
+            let lifespan = random_lifespan(&mut rng, &config);
+            assert!(
+                (CREATURE_LIFETIME_MIN_TICKS..=CREATURE_LIFETIME_MAX_TICKS).contains(&lifespan),
+                "срок жизни {lifespan} вне диапазона 900..=1100"
+            );
+            seen_min = seen_min.min(lifespan);
+            seen_max = seen_max.max(lifespan);
+        }
+
+        assert!(
+            seen_max - seen_min > 100,
+            "разброс сроков жизни слишком маленький: {seen_min}..={seen_max}"
         );
     }
 
@@ -3841,7 +4258,7 @@ mod tests {
     }
 
     #[test]
-    fn split_in_a_dead_end_kills_the_cell_and_returns_minerals() {
+    fn split_in_a_dead_end_keeps_the_cell_alive() {
         let mut jar = Jar::with_seed(10, 5);
         // Замораживаем всех соседей: делиться некуда.
         for (dx, dy) in [(1isize, 0isize), (-1, 0), (0, 1), (0, -1)] {
@@ -3853,29 +4270,71 @@ mod tests {
             }
         }
 
-        jar.creatures[5 + 5 * 10] = Some(Creature::new(genome_of(CreatureAction::Split)));
-        jar.creatures[5 + 5 * 10].as_mut().unwrap().energy = 100;
-        jar.creatures[5 + 5 * 10].as_mut().unwrap().minerals = 20;
+        let index = 5 + 5 * 10;
+        jar.creatures[index] = Some(Creature::new(genome_of(CreatureAction::Split)));
+        jar.creatures[index].as_mut().unwrap().energy = 150;
+        jar.creatures[index].as_mut().unwrap().minerals = 20;
 
         let before = total_minerals(&jar);
         jar.simulation_step();
         let after = total_minerals(&jar);
 
-        assert!(
-            jar.creatures[5 + 5 * 10].is_none(),
-            "в тупике клетка должна умереть"
+        let cell = jar.creatures[index]
+            .as_ref()
+            .expect("в тупике клетка должна остаться жива");
+        assert_eq!(
+            cell.energy, 100,
+            "энергия зажатой клетки не должна копиться выше порога деления"
         );
-        assert_eq!(before, after, "минералы должны вернуться в поле");
+        assert_eq!(cell.minerals, 20, "минералы должны остаться у клетки");
+        assert_eq!(before, after, "минералы не должны пропадать");
+    }
+
+    #[test]
+    fn blocked_cell_divides_once_space_frees() {
+        let mut jar = Jar::with_seed(10, 5);
+        for (dx, dy) in [(1isize, 0isize), (-1, 0), (0, 1), (0, -1)] {
+            let x = 5 + dx;
+            let y = 5 + dy;
+            if x >= 0 && y >= 0 && (x as usize) < 10 && (y as usize) < 10 {
+                jar.creatures[x as usize + y as usize * 10] =
+                    Some(Creature::new(genome_of(CreatureAction::PhotoGrow)));
+            }
+        }
+
+        let index = 5 + 5 * 10;
+        jar.creatures[index] = Some(Creature::new(genome_of(CreatureAction::Split)));
+        jar.creatures[index].as_mut().unwrap().energy = 100;
+        jar.creatures[index].as_mut().unwrap().minerals = 20;
+
+        // Первый тик: делиться некуда, клетка остается.
+        jar.simulation_step();
+        assert!(jar.creatures[index].is_some());
+
+        // Освобождаем соседа справа - клетка сразу делится.
+        jar.creatures[6 + 5 * 10] = None;
+        jar.simulation_step();
+
+        assert!(
+            jar.creatures[index].is_some(),
+            "мать должна остаться на месте"
+        );
+        assert!(
+            jar.creatures[6 + 5 * 10].is_some(),
+            "клетка должна поделиться в освободившуюся клетку"
+        );
     }
 
     #[test]
     fn dying_of_old_age_returns_minerals_to_the_field() {
         let config = Config {
-            lifetime_ticks: 3,
+            lifetime_min_ticks: 3,
+            lifetime_max_ticks: 3,
             ..Config::default()
         };
         let mut jar = Jar::with_config_and_seed(10, config, 21);
         jar.creatures[0] = Some(Creature::new(genome_of(CreatureAction::PhotoGrow)));
+        jar.creatures[0].as_mut().unwrap().lifespan = 3;
         jar.creatures[0].as_mut().unwrap().minerals = 9;
 
         let before = total_minerals(&jar);
@@ -3990,13 +4449,13 @@ mod tests {
     }
 
     #[test]
-    fn jump_mutation_changes_the_jump_value() {
+    fn value_mutation_changes_the_jump_value() {
         let mut rng = Rng::new(8);
         let mut genome = CreatureGenome::from_line(vec![CreatureAction::Jump(1)]);
 
         for _ in 0..50 {
             let before = genome.genes()[0];
-            genome.apply_mutation(MutationKind::Jump, &mut rng);
+            genome.apply_mutation(MutationKind::Value, &mut rng);
             assert_ne!(genome.genes()[0], before, "значение прыжка должно меняться");
             if let CreatureAction::Jump(value) = genome.genes()[0] {
                 assert!(value != 0, "нулевой прыжок бессмысленен");
@@ -4065,6 +4524,302 @@ mod tests {
             "суммарная энергия детей превысила энергию матери"
         );
         assert_eq!(first.minerals + second.minerals, mother.minerals);
+    }
+
+    // ----------------------------------------------------------------------
+    // Новые гены: Share, Attack, JumpIf
+    // ----------------------------------------------------------------------
+
+    /// Банка с двумя клетками рядом: левая стоит левее правой.
+    ///
+    /// Индексы возвращаются в том же порядке, в котором клетки стоят
+    /// на поле: левая обходится первой.
+    fn jar_with_pair(left: CreatureGenome, right: CreatureGenome) -> (Jar, usize, usize) {
+        let size = 9;
+        let mut jar = Jar::with_seed(size, 3);
+        let left_index = 4 + 4 * size;
+        let right_index = 5 + 4 * size;
+        jar.creatures[left_index] = Some(Creature::new(left));
+        jar.creatures[right_index] = Some(Creature::new(right));
+        (jar, left_index, right_index)
+    }
+
+    /// Генотип воина: сначала проверка "рядом нет чужих", потом удар.
+    ///
+    /// Пока чужих нет, указатель перепрыгивает удар и воин ждет.
+    /// Как только чужой появился рядом, удар случается.
+    fn warrior_genome() -> CreatureGenome {
+        CreatureGenome::from_line(vec![
+            CreatureAction::JumpIf(KinCondition::NoFoe, 1),
+            CreatureAction::Attack,
+        ])
+    }
+
+    #[test]
+    fn share_moves_energy_to_a_neighbour() {
+        let (mut jar, left, right) = jar_with_pair(
+            genome_of(CreatureAction::Share),
+            genome_of(CreatureAction::Jump(1)),
+        );
+
+        jar.creatures[left].as_mut().unwrap().energy = 100;
+        jar.creatures[right].as_mut().unwrap().energy = 0;
+
+        jar.simulation_step();
+
+        let giver = jar.creatures[left].as_ref().unwrap();
+        let taker = jar.creatures[right].as_ref().unwrap();
+
+        assert_eq!(giver.energy, 100 - SHARE_AMOUNT, "щедрый не отдал энергию");
+        assert_eq!(taker.energy, SHARE_AMOUNT, "сосед не получил энергию");
+    }
+
+    #[test]
+    fn share_without_neighbours_costs_nothing() {
+        let mut jar = jar_with(genome_of(CreatureAction::Share), 9);
+        jar.creatures[0].as_mut().unwrap().energy = 100;
+
+        jar.simulation_step();
+
+        assert_eq!(
+            jar.creatures[0].as_ref().unwrap().energy,
+            100,
+            "одиночка отдал энергию в пустоту"
+        );
+    }
+
+    #[test]
+    fn attack_takes_more_than_it_costs() {
+        let (mut jar, left, right) = jar_with_pair(
+            genome_of(CreatureAction::Attack),
+            genome_of(CreatureAction::Jump(1)),
+        );
+
+        jar.creatures[left].as_mut().unwrap().energy = 100;
+        jar.creatures[right].as_mut().unwrap().energy = 100;
+
+        jar.simulation_step();
+
+        let attacker = jar.creatures[left].as_ref().unwrap();
+        let victim = jar.creatures[right].as_ref().unwrap();
+
+        assert_eq!(attacker.energy, 100 - ATTACK_COST, "атака стоила не столько, сколько должна");
+        assert_eq!(victim.energy, 100 - ATTACK_DAMAGE, "жертва потеряла не столько, сколько должна");
+        assert!(
+            ATTACK_DAMAGE > ATTACK_COST,
+            "урон должен быть больше цены атаки, иначе война не истощает"
+        );
+    }
+
+    #[test]
+    fn attack_kills_when_energy_reaches_zero() {
+        let (mut jar, left, right) = jar_with_pair(
+            genome_of(CreatureAction::Attack),
+            genome_of(CreatureAction::Jump(1)),
+        );
+
+        jar.creatures[left].as_mut().unwrap().energy = 100;
+        let victim = jar.creatures[right].as_mut().unwrap();
+        victim.energy = ATTACK_DAMAGE;
+        victim.minerals = 7;
+
+        let minerals_before = jar.minerals[right];
+        jar.simulation_step();
+
+        assert!(jar.creatures[right].is_none(), "жертва выжила после смертельного удара");
+        assert_eq!(
+            jar.minerals[right],
+            minerals_before + 7,
+            "минералы погибшей клетки не вернулись в поле"
+        );
+    }
+
+    #[test]
+    fn attack_without_neighbours_costs_nothing() {
+        let mut jar = jar_with(genome_of(CreatureAction::Attack), 9);
+        jar.creatures[0].as_mut().unwrap().energy = 100;
+
+        jar.simulation_step();
+
+        assert_eq!(
+            jar.creatures[0].as_ref().unwrap().energy,
+            100,
+            "атака в пустоту стоила энергии"
+        );
+    }
+
+    #[test]
+    fn jump_if_low_energy_shifts_the_pointer_only_when_hungry() {
+        let genome = CreatureGenome::from_line(vec![
+            CreatureAction::JumpIf(KinCondition::LowEnergy, 1),
+            CreatureAction::PhotoGrow,
+        ]);
+
+        let mut hungry = jar_with(genome.clone(), 9);
+        hungry.creatures[0].as_mut().unwrap().energy = LOW_ENERGY - 1;
+        hungry.simulation_step();
+        assert_eq!(
+            hungry.creatures[0].as_ref().unwrap().genome.line_pointer,
+            2,
+            "голодная клетка должна сместить указатель"
+        );
+
+        let mut full = jar_with(genome, 9);
+        full.creatures[0].as_mut().unwrap().energy = LOW_ENERGY;
+        full.simulation_step();
+        assert_eq!(
+            full.creatures[0].as_ref().unwrap().genome.line_pointer,
+            1,
+            "сытая клетка не должна смещать указатель"
+        );
+    }
+
+    #[test]
+    fn jump_if_reads_the_genomes_of_the_neighbours() {
+        let genome = CreatureGenome::from_line(vec![
+            CreatureAction::JumpIf(KinCondition::HasFoe, 1),
+            CreatureAction::PhotoGrow,
+        ]);
+
+        // Сосед с другой ДНК - чужой, поэтому указатель смещается.
+        let (mut with_foe, _, _) = jar_with_pair(genome.clone(), genome_of(CreatureAction::Jump(1)));
+        with_foe.simulation_step();
+        assert_eq!(
+            with_foe.creatures[40].as_ref().unwrap().genome.line_pointer,
+            2,
+            "клетка должна заметить чужую ДНК рядом"
+        );
+
+        // Сосед с такой же ДНК - свой, поэтому указатель на месте.
+        let (mut with_kin, _, _) = jar_with_pair(genome.clone(), genome);
+        with_kin.simulation_step();
+        assert_eq!(
+            with_kin.creatures[40].as_ref().unwrap().genome.line_pointer,
+            1,
+            "клетка не должна считать своего чужим"
+        );
+    }
+
+    #[test]
+    fn kin_similarity_is_symmetric_and_ignores_gene_order() {
+        let first = CreatureGenome::from_line(vec![
+            CreatureAction::PhotoGrow,
+            CreatureAction::EatMinerals,
+            CreatureAction::Split,
+            CreatureAction::PhotoGrow,
+        ]);
+        let second = CreatureGenome::from_line(vec![
+            CreatureAction::Split,
+            CreatureAction::PhotoGrow,
+            CreatureAction::PhotoGrow,
+            CreatureAction::EatMinerals,
+        ]);
+
+        assert_eq!(
+            first.similarity_to(&second),
+            100,
+            "порядок генов не должен влиять на сходство"
+        );
+        assert_eq!(
+            second.similarity_to(&first),
+            first.similarity_to(&second),
+            "сходство должно быть симметричным"
+        );
+    }
+
+    #[test]
+    fn kin_similarity_falls_after_enough_replacements() {
+        let mut rng = Rng::new(21);
+        let ancestor = CreatureGenome::standard();
+        let mut genome = ancestor.clone();
+
+        for _ in 0..200 {
+            genome.apply_mutation(MutationKind::Replace, &mut rng);
+        }
+
+        assert!(
+            genome.similarity_to(&ancestor) < KIN_SIMILARITY_PERCENT,
+            "после многих замен клетка должна стать чужой: {}%",
+            genome.similarity_to(&ancestor)
+        );
+    }
+
+    #[test]
+    fn start_genomes_are_kins_of_each_other() {
+        // Стартовые геномы отличаются всего на один ген, поэтому все
+        // четыре колонии начинают как одна семья: сначала они сливаются,
+        // а расходятся уже в ходе эволюции.
+        let genomes = [genome_top(), genome_right(), genome_bottom(), genome_left()];
+
+        for i in 0..genomes.len() {
+            for j in (i + 1)..genomes.len() {
+                let similarity = genomes[i].similarity_to(&genomes[j]);
+                assert!(
+                    similarity >= KIN_SIMILARITY_PERCENT,
+                    "стартовые геномы {i} и {j} слишком разные: {similarity}%"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn start_genomes_differ_from_the_base_only_by_one_gene() {
+        let base = genome_base();
+
+        for genome in [genome_top(), genome_right(), genome_bottom(), genome_left()] {
+            assert_eq!(
+                genome.len(),
+                base.len(),
+                "геномы должны отличаться от базы только составом, а не длиной"
+            );
+        }
+    }
+
+    #[test]
+    fn war_starts_between_different_genomes() {
+        let (mut jar, left, right) = jar_with_pair(warrior_genome(), genome_of(CreatureAction::Jump(1)));
+
+        jar.creatures[left].as_mut().unwrap().energy = 100;
+        jar.creatures[right].as_mut().unwrap().energy = 100;
+
+        // Первый тик: воин только замечает чужого рядом.
+        jar.simulation_step();
+        assert_eq!(
+            jar.creatures[left].as_ref().unwrap().energy,
+            100,
+            "воин ударил в первый же тик"
+        );
+
+        // Второй тик: удар.
+        jar.simulation_step();
+
+        let attacker = jar.creatures[left].as_ref().unwrap();
+        let victim = jar.creatures[right].as_ref().unwrap();
+        assert_eq!(attacker.energy, 100 - ATTACK_COST, "воин не заплатил за удар");
+        assert_eq!(victim.energy, 100 - ATTACK_DAMAGE, "чужая клетка не пострадала");
+    }
+
+    #[test]
+    fn kin_do_not_fight_each_other() {
+        let (mut jar, left, right) = jar_with_pair(warrior_genome(), warrior_genome());
+
+        jar.creatures[left].as_mut().unwrap().energy = 100;
+        jar.creatures[right].as_mut().unwrap().energy = 100;
+
+        for _ in 0..10 {
+            jar.simulation_step();
+        }
+
+        assert_eq!(
+            jar.creatures[left].as_ref().unwrap().energy,
+            100,
+            "свои подрались между собой"
+        );
+        assert_eq!(
+            jar.creatures[right].as_ref().unwrap().energy,
+            100,
+            "свои подрались между собой"
+        );
     }
 
     // ----------------------------------------------------------------------
@@ -4384,12 +5139,15 @@ mod tests {
                 ActionKind::EatMinerals => CreatureAction::EatMinerals,
                 ActionKind::Split => CreatureAction::Split,
                 ActionKind::Jump => CreatureAction::Jump(1),
+                ActionKind::Share => CreatureAction::Share,
+                ActionKind::Attack => CreatureAction::Attack,
+                ActionKind::JumpIf => CreatureAction::JumpIf(KinCondition::HasKin, 1),
             };
             assert_eq!(action_label(Some(action)), kind.label());
         }
 
         assert_eq!(mix_label(None), "-");
-        let label = mix_label(Some([255, 0, 0, 0]));
+        let label = mix_label(Some([255, 0, 0, 0, 0, 0, 0]));
         assert!(label.contains("photo 100%"), "подпись состава: {label}");
         assert!(label.contains("jump 0%"), "подпись состава: {label}");
     }
@@ -5297,6 +6055,11 @@ mod tests {
                             CreatureAction::PhotoGrow => mix(2),
                             CreatureAction::EatMinerals => mix(3),
                             CreatureAction::Jump(delta) => mix(4 + *delta as u64),
+                            CreatureAction::Share => mix(12),
+                            CreatureAction::Attack => mix(13),
+                            CreatureAction::JumpIf(condition, delta) => {
+                                mix(14 + *condition as u64 * 8 + (*delta as i64 + 8) as u64)
+                            }
                         }
                     }
                 }
@@ -5324,7 +6087,7 @@ mod tests {
 
         assert_eq!(
             state_hash(&jar),
-            5763222493178675409,
+            7395578395058024994,
             "состояние симуляции изменилось: правила ведут себя иначе"
         );
     }
@@ -5409,7 +6172,14 @@ mod tests {
         let second = Jar::with_seed(10, 77);
 
         assert_eq!(first.size, second.size);
-        assert_eq!(first.config.lifetime_ticks, second.config.lifetime_ticks);
+        assert_eq!(
+            first.config.lifetime_min_ticks,
+            second.config.lifetime_min_ticks
+        );
+        assert_eq!(
+            first.config.lifetime_max_ticks,
+            second.config.lifetime_max_ticks
+        );
         assert_eq!(first.minerals, second.minerals);
     }
 
@@ -5455,30 +6225,54 @@ mod tests {
         let mut jar = seeded_jar();
         jar.rng = Rng::new(0xC0FFEE);
 
-        // Начальные места четырех колоний.
-        let colonies = [
-            ("верх", 50usize, 2usize),
-            ("право", 97, 50),
-            ("низ", 50, 97),
-            ("лево", 2, 50),
-        ];
-
         for _ in 0..300 {
             jar.simulation_step();
         }
 
-        // Колония жива, если в ее регионе есть клетки:
+        // Колония жива, если у неё остался хотя бы один потомок:
         // конкретная клетка может умереть от старости или задохнуться
-        // в тупике, но колония продолжит жизнь в соседях.
-        for (name, x, y) in colonies {
-            let alive = (0..jar.size)
-                .flat_map(|row| (0..jar.size).map(move |col| (col, row)))
-                .filter(|(col, row)| col.abs_diff(x) <= 6 && row.abs_diff(y) <= 6)
-                .filter(|(col, row)| jar.creatures[col + row * jar.size].is_some())
+        // в тупике, но линия должна продолжиться.
+        for (name, genome) in [
+            ("верх", genome_top()),
+            ("право", genome_right()),
+            ("низ", genome_bottom()),
+            ("лево", genome_left()),
+        ] {
+            let alive = jar
+                .creatures
+                .iter()
+                .flatten()
+                .filter(|creature| {
+                    creature.genome.similarity_to(&genome) >= KIN_SIMILARITY_PERCENT
+                })
                 .count();
 
             assert!(alive > 0, "колония {name} вымерла");
         }
+    }
+
+    #[test]
+    fn initial_cells_spawn_in_random_places() {
+        // Стартовые клетки не привязаны к краям: две банки с разными
+        // зёрнами должны давать разные расстановки.
+        let first = seeded_jar();
+        let second = seeded_jar();
+
+        let positions = |jar: &Jar| -> Vec<usize> {
+            jar.creatures
+                .iter()
+                .enumerate()
+                .filter(|(_, cell)| cell.is_some())
+                .map(|(index, _)| index)
+                .collect()
+        };
+
+        assert_eq!(positions(&first).len(), 12, "стартовых клеток должно быть двенадцать");
+        assert_ne!(
+            positions(&first),
+            positions(&second),
+            "стартовые клетки должны появляться в случайных местах"
+        );
     }
 
     #[test]
@@ -5513,7 +6307,7 @@ mod tests {
         let mut rng = Rng::new(123);
         let mut genome = CreatureGenome::from_line(vec![CreatureAction::Jump(5)]);
 
-        assert!(genome.mutate_jump_value(&mut rng));
+        assert!(genome.mutate_value(&mut rng));
         assert_ne!(genome.genes()[0], CreatureAction::Jump(5));
     }
 
@@ -5797,7 +6591,8 @@ mod tests {
     fn many_seeds_survive_many_ticks() {
         for seed in 0..50u64 {
             let config = Config {
-                lifetime_ticks: 200,
+                lifetime_min_ticks: 200,
+                lifetime_max_ticks: 220,
                 ..Config::default()
             };
             let mut jar = Jar::with_config_and_seed(30, config, seed * 104_729 + 3);
