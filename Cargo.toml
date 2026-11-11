@@ -4,5 +4,6 @@ version = "0.0.1"
 edition = "2024"
 
 [dependencies]
+font8x8 = "0.3"
 softbuffer = "0.4"
 winit = "0.30"

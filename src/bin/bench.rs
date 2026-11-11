@@ -11,7 +11,7 @@ mod app;
 
 use std::time::{Duration, Instant};
 
-use app::{BACKGROUND_COLOR, ViewMode, draw_snapshot, seeded_jar};
+use app::{ViewMode, draw_frame, seeded_jar};
 
 /// Бюджет одного кадра при 60 fps.
 const FRAME_BUDGET: Duration = Duration::from_micros(16_667);
@@ -22,16 +22,16 @@ const ITERATIONS: u32 = 60;
 fn bench(view: ViewMode, cell: u32, width: u32, height: u32) {
     let jar = seeded_jar();
     let snapshot = jar.snapshot();
-    let mut buffer = vec![BACKGROUND_COLOR; (width * height) as usize];
+    let mut buffer = vec![0u32; (width * height) as usize];
 
     // Прогрев, чтобы не мерить компиляцию и первый вызов.
     for _ in 0..5 {
-        draw_snapshot(&mut buffer, width, height, &snapshot, view, cell, 50, 50);
+        draw_frame(&mut buffer, width, height, &snapshot, view, cell, (50, 50));
     }
 
     let start = Instant::now();
     for _ in 0..ITERATIONS {
-        draw_snapshot(&mut buffer, width, height, &snapshot, view, cell, 50, 50);
+        draw_frame(&mut buffer, width, height, &snapshot, view, cell, (50, 50));
     }
     let per_frame = start.elapsed() / ITERATIONS;
 

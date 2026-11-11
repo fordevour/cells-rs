@@ -12,7 +12,7 @@ mod app;
 
 use std::path::{Path, PathBuf};
 
-use app::{BACKGROUND_COLOR, Jar, ViewMode, draw_snapshot, seeded_jar};
+use app::{Jar, ViewMode, draw_frame, seeded_jar};
 
 /// Каталог для снимков.
 fn output_dir() -> PathBuf {
@@ -54,17 +54,8 @@ fn render(shot: Shot<'_>) {
         height,
     } = shot;
 
-    let mut buffer = vec![BACKGROUND_COLOR; (width * height) as usize];
-    draw_snapshot(
-        &mut buffer,
-        width,
-        height,
-        snapshot,
-        view,
-        cell,
-        cursor.0,
-        cursor.1,
-    );
+    let mut buffer = vec![0u32; (width * height) as usize];
+    draw_frame(&mut buffer, width, height, snapshot, view, cell, cursor);
 
     let mut data = format!("P6\n{width} {height}\n255\n").into_bytes();
     for pixel in &buffer {
@@ -111,6 +102,7 @@ fn main() {
         ("minerals-z32", ViewMode::Minerals),
         ("energy-z32", ViewMode::Energy),
         ("genome-z32", ViewMode::Genome),
+        ("action-z32", ViewMode::Action),
     ] {
         render(Shot {
             dir: &dir,
@@ -150,16 +142,18 @@ fn main() {
         height: 900,
     });
 
-    // То, что пользователь видит при запуске окна.
+    // То, что пользователь видит при запуске окна: поле вписано в окно целиком.
     let (_, start) = state_after(0);
-    render(Shot {
-        dir: &dir,
-        name: "startup",
-        snapshot: &start,
-        view: ViewMode::Creatures,
-        cell: 16,
-        cursor: (50, 50),
-        width: 800,
-        height: 800,
-    });
+    for (name, cell) in [("startup", 8), ("startup-zoom", 32)] {
+        render(Shot {
+            dir: &dir,
+            name,
+            snapshot: &start,
+            view: ViewMode::Creatures,
+            cell,
+            cursor: (50, 2),
+            width: 800,
+            height: 800,
+        });
+    }
 }
