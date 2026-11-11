@@ -1,3 +1,13 @@
+//! Cells: жизнь в банке.
+//!
+//! Файл один: так проще видеть, как правила симуляции, отрисовка и ввод
+//! связаны между собой. Внутри он разбит на разделы:
+//!
+//! * правила — [`Config`], [`Grid`], [`Jar`], [`Creature`];
+//! * гены — [`ActionKind`], [`CreatureGenome`];
+//! * интерфейс — [`Camera`], [`KeyRepeat`], [`SimClock`], [`Command`];
+//! * картинка — [`ViewMode`], [`Canvas`].
+
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -13,6 +23,12 @@ use winit::window::{Window, WindowId};
 const FRAME_TIME: Duration = Duration::from_micros(16_667);
 const MIN_CELL_SIZE: u32 = 3;
 const MAX_CELL_SIZE: u32 = 64;
+
+/// Шкала зума: размеры клетки, между которыми переключается камера.
+///
+/// Ступени идут от мелких клеток к крупным. Благодаря общей шкале
+/// зум всегда обратим: шаг вверх и шаг вниз возвращают тот же размер.
+const ZOOM_LEVELS: [u32; 14] = [3, 4, 5, 6, 8, 10, 12, 16, 20, 24, 32, 40, 48, 64];
 
 /// Задержка перед автоповтором перемещения выделения.
 const REPEAT_DELAY: Duration = Duration::from_millis(180);
@@ -32,6 +48,16 @@ const MUTATION_CHANCE_PERCENT: u64 = 5;
 const MAX_SPEED: u32 = u32::MAX;
 /// Максимальное замедление: один тик раз в столько кадров.
 const MAX_FRAMES_PER_TICK: u32 = 64;
+/// Сколько генов в стандартном геноме.
+const GENOME_LEN: usize = 16;
+/// Сколько энергии нужно клетке для деления.
+const SPLIT_ENERGY: usize = 100;
+/// Сколько минералов нужно клетке для деления.
+const SPLIT_MINERALS: usize = 10;
+/// Сколько процентов энергии матери достается каждому ребенку.
+const SPLIT_ENERGY_SHARE_PERCENT: usize = 40;
+/// Сколько минералов изначально лежит в каждой клетке поля.
+const INITIAL_MINERALS: usize = 100;
 
 /// Насколько сильно вспышка рождения или смерти перекрывает клетку.
 const FLASH_STRENGTH: u32 = 200;
@@ -49,7 +75,7 @@ const TITLE_INTERVAL: Duration = Duration::from_millis(200);
 const JAR_FRAME_THICKNESS: u32 = 3;
 /// Высота внутренней тени банки в пикселях.
 const JAR_SHADOW_THICKNESS: u32 = 2;
-/// Размер стороны мини-карты в пикселях (одна клетка — один пиксель).
+/// Размер стороны мини-карты в пикселях.
 const MINIMAP_SIZE: u32 = 100;
 /// Отступ панелей от края окна в пикселях.
 const PANEL_MARGIN: u32 = 6;
@@ -65,6 +91,14 @@ const FONT_HEIGHT: u32 = 8;
 const TEXT_ADVANCE: u32 = FONT_WIDTH + 1;
 /// Внутренний отступ панели в пикселях.
 const PANEL_PADDING: u32 = 4;
+/// Сколько миллисекунд на кадр разрешено тратить на тики симуляции.
+///
+/// Ограничение спасает окно от зависания, когда скорость выкручена вверх.
+const TICK_BUDGET: Duration = Duration::from_millis(8);
+
+// ===========================================================================
+// Палитра
+// ===========================================================================
 
 /// Палитра отрисовки: все цвета в одном месте.
 struct Palette {
@@ -90,8 +124,8 @@ struct Palette {
     panel_border: u32,
     /// Текст HUD.
     panel_text: u32,
-    /// Цвета типов действий: PhotoGrow, EatMinerals, Split, Jump.
-    action_colors: [u32; 4],
+    /// Цвета типов действий: по [`ActionKind::index`].
+    action_colors: [u32; ActionKind::COUNT],
 }
 
 impl Palette {
@@ -119,8 +153,11 @@ impl Palette {
     }
 }
 
+/// Опорная точка градиента: значение и цвет.
+type Stop = (u32, (u32, u32, u32));
+
 /// Рампа минералов: холодная, от светлого к тёмному.
-const MINERAL_RAMP: [(u32, (u32, u32, u32)); 5] = [
+const MINERAL_RAMP: [Stop; 5] = [
     (0, (207, 227, 245)),
     (64, (159, 201, 236)),
     (128, (95, 168, 222)),
@@ -129,13 +166,128 @@ const MINERAL_RAMP: [(u32, (u32, u32, u32)); 5] = [
 ];
 
 /// Рампа энергии: тёплая, от светлого к тёмному.
-const ENERGY_RAMP: [(u32, (u32, u32, u32)); 5] = [
+const ENERGY_RAMP: [Stop; 5] = [
     (0, (255, 224, 184)),
     (64, (255, 192, 120)),
     (128, (247, 148, 72)),
     (192, (222, 90, 30)),
     (255, (122, 46, 8)),
 ];
+
+/// Рампа освещенности: от почти черной тьмы в центре через синий
+/// и теплый оранжевый к мягкому солнечному свету у края.
+const LIGHT_RAMP: [Stop; 4] = [
+    (0, (8, 10, 24)),
+    (90, (36, 50, 112)),
+    (180, (212, 116, 52)),
+    (255, (255, 244, 190)),
+];
+
+// ===========================================================================
+// Типы генов
+// ===========================================================================
+
+/// Тип гена: что именно делает клетка, выполняя этот ген.
+///
+/// Реестр типов — единственное место, где перечислены все гены.
+/// Добавление нового гена требует добавить его сюда, а остальные
+/// места (палитра, подписи, доли генома) соберутся компилятором.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ActionKind {
+    /// Фотосинтез: клетка получает энергию из света.
+    PhotoGrow,
+    /// Еда: клетка тратит энергию и забирает минерал из поля.
+    EatMinerals,
+    /// Деление: клетка делится на две, если хватает энергии и минералов.
+    Split,
+    /// Прыжок: указатель ДНК сдвигается на дополнительное число.
+    Jump,
+}
+
+impl ActionKind {
+    /// Все типы генов. Порядок задает индексы в палитре и в составе генома.
+    pub const ALL: [ActionKind; 4] = [Self::PhotoGrow, Self::EatMinerals, Self::Split, Self::Jump];
+
+    /// Сколько всего типов генов.
+    pub const COUNT: usize = Self::ALL.len();
+
+    /// Индекс типа гена: по нему ищется цвет в палитре.
+    pub const fn index(self) -> usize {
+        match self {
+            Self::PhotoGrow => 0,
+            Self::EatMinerals => 1,
+            Self::Split => 2,
+            Self::Jump => 3,
+        }
+    }
+
+    /// Короткое имя типа гена.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::PhotoGrow => "photo",
+            Self::EatMinerals => "eat",
+            Self::Split => "split",
+            Self::Jump => "jump",
+        }
+    }
+
+    /// Оттенок гена в градусах HSV.
+    pub const fn hue(self) -> f32 {
+        match self {
+            Self::PhotoGrow => 120.0,
+            Self::EatMinerals => 240.0,
+            Self::Split => 0.0,
+            Self::Jump => 300.0,
+        }
+    }
+}
+
+/// Действие, которое клетка выполняет по очередному гену.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CreatureAction {
+    /// Деление.
+    Split,
+    /// Фотосинтез.
+    PhotoGrow,
+    /// Еда.
+    EatMinerals,
+    /// Сдвинуть указатель ДНК на X (вдобавок к обычному +1).
+    Jump(isize),
+}
+
+impl CreatureAction {
+    /// Тип гена, к которому относится действие.
+    pub fn kind(self) -> ActionKind {
+        match self {
+            CreatureAction::Split => ActionKind::Split,
+            CreatureAction::PhotoGrow => ActionKind::PhotoGrow,
+            CreatureAction::EatMinerals => ActionKind::EatMinerals,
+            CreatureAction::Jump(_) => ActionKind::Jump,
+        }
+    }
+}
+
+/// Способ мутации генома.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MutationKind {
+    /// Вставить новый ген.
+    Insert,
+    /// Изменить значение гена Jump.
+    Jump,
+    /// Удалить ген.
+    Remove,
+    /// Заменить ген на другой.
+    Replace,
+}
+
+impl MutationKind {
+    /// Все способы мутации.
+    pub const ALL: [MutationKind; 4] = [Self::Insert, Self::Jump, Self::Remove, Self::Replace];
+}
+
+// ===========================================================================
+// Случайность
+// ===========================================================================
 
 /// Простой генератор псевдослучайных чисел (xorshift64*).
 pub struct Rng(u64);
@@ -182,36 +334,928 @@ impl Rng {
 }
 
 /// Случайный ген для вставки или замены.
-fn random_action(rng: &mut Rng) -> CreatureAction {
-    match rng.below(4) {
-        0 => CreatureAction::PhotoGrow,
-        1 => CreatureAction::EatMinerals,
-        2 => CreatureAction::Split,
-        _ => CreatureAction::Jump(random_jump_delta(rng)),
+pub fn random_action(rng: &mut Rng) -> CreatureAction {
+    match ActionKind::ALL[rng.below(ActionKind::COUNT)] {
+        ActionKind::PhotoGrow => CreatureAction::PhotoGrow,
+        ActionKind::EatMinerals => CreatureAction::EatMinerals,
+        ActionKind::Split => CreatureAction::Split,
+        ActionKind::Jump => CreatureAction::Jump(random_jump_delta(rng)),
     }
 }
 
 /// Случайное ненулевое значение для гена Jump.
-fn random_jump_delta(rng: &mut Rng) -> isize {
+///
+/// Диапазон значений: от -4 до 4, причем ноль не выпадает:
+/// ген прыжка всегда что-то сдвигает.
+pub fn random_jump_delta(rng: &mut Rng) -> isize {
     let delta = rng.below(8) as isize - 4;
     if delta >= 0 { delta + 1 } else { delta }
 }
 
-fn main() {
-    let jar = seeded_jar();
+// ===========================================================================
+// Сетка и настройки
+// ===========================================================================
 
-    let event_loop = match EventLoop::new() {
-        Ok(event_loop) => event_loop,
-        Err(err) => {
-            eprintln!("Не удалось создать event loop: {err}");
-            return;
+/// Сетка поля: квадратная сетка клеток с индексацией построчно.
+///
+/// Индекс клетки — это `x + y * size`, поэтому все обращения к полю
+/// считаются одним и тем же способом.
+#[derive(Clone, Copy, Debug)]
+pub struct Grid {
+    /// Ширина и высота поля.
+    pub size: usize,
+}
+
+impl Grid {
+    /// Создает сетку такого размера.
+    pub fn new(size: usize) -> Self {
+        Self { size }
+    }
+
+    /// Сколько всего клеток в поле.
+    pub fn len(self) -> usize {
+        self.size * self.size
+    }
+
+    /// Пусто ли поле.
+    pub fn is_empty(self) -> bool {
+        self.size == 0
+    }
+
+    /// Индекс клетки по координатам.
+    pub fn idx(self, x: usize, y: usize) -> usize {
+        x + y * self.size
+    }
+
+    /// Координаты клетки по индексу.
+    pub fn xy(self, index: usize) -> (usize, usize) {
+        if self.size == 0 {
+            return (0, 0);
         }
-    };
-    event_loop.set_control_flow(ControlFlow::Wait);
+        (index % self.size, index / self.size)
+    }
 
-    let mut app = App::new(jar);
-    if let Err(err) = event_loop.run_app(&mut app) {
-        eprintln!("Ошибка event loop: {err}");
+    /// Внутри ли поля клетка.
+    pub fn in_bounds(self, x: usize, y: usize) -> bool {
+        x < self.size && y < self.size
+    }
+
+    /// Соседи клетки по четырем сторонам, без выхода за границы поля.
+    ///
+    /// Порядок: вправо, влево, вниз, вверх.
+    pub fn neighbors4(self, index: usize) -> impl Iterator<Item = usize> {
+        let (x, y) = self.xy(index);
+        let directions = [(1isize, 0isize), (-1, 0), (0, 1), (0, -1)];
+
+        directions.into_iter().filter_map(move |(dx, dy)| {
+            let nx = x as isize + dx;
+            let ny = y as isize + dy;
+            if nx < 0 || ny < 0 {
+                return None;
+            }
+            let (nx, ny) = (nx as usize, ny as usize);
+            if !self.in_bounds(nx, ny) {
+                return None;
+            }
+            Some(self.idx(nx, ny))
+        })
+    }
+}
+
+/// Настройки симуляции.
+///
+/// Один и тот же набор правил применяется ко всем банкам: меняя
+/// [`Config`], можно получить короткоживущие клетки или быстрое
+/// деление, не затрагивая код правил.
+#[derive(Clone, Copy, Debug)]
+pub struct Config {
+    /// Сколько тиков живет клетка, после чего умирает.
+    pub lifetime_ticks: usize,
+    /// Максимальный прирост энергии от фотосинтеза за тик.
+    pub max_photosynthesis_energy: usize,
+    /// Сколько энергии тратит поедание одного минерала.
+    pub eat_minerals_energy_cost: usize,
+    /// Шанс мутации генома при делении, в процентах.
+    pub mutation_chance_percent: u64,
+    /// Сколько энергии нужно клетке для деления.
+    pub split_energy: usize,
+    /// Сколько минералов нужно клетке для деления.
+    pub split_minerals: usize,
+    /// Сколько процентов энергии матери достается каждому ребенку.
+    pub split_energy_share_percent: usize,
+    /// Сколько минералов изначально лежит в каждой клетке поля.
+    pub initial_minerals: usize,
+    /// Сколько генов в стандартном геноме.
+    pub genome_len: usize,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            lifetime_ticks: CREATURE_LIFETIME_TICKS,
+            max_photosynthesis_energy: MAX_PHOTOSYNTHESIS_ENERGY,
+            eat_minerals_energy_cost: EAT_MINERALS_ENERGY_COST,
+            mutation_chance_percent: MUTATION_CHANCE_PERCENT,
+            split_energy: SPLIT_ENERGY,
+            split_minerals: SPLIT_MINERALS,
+            split_energy_share_percent: SPLIT_ENERGY_SHARE_PERCENT,
+            initial_minerals: INITIAL_MINERALS,
+            genome_len: GENOME_LEN,
+        }
+    }
+}
+
+// ===========================================================================
+// Геном
+// ===========================================================================
+
+/// Нить "ДНК" клетки.
+#[derive(Clone, Debug)]
+pub struct CreatureGenome {
+    /// Гены клетки: порядок определяет, что клетка делает по кругу.
+    line: Vec<CreatureAction>,
+    /// Текущий указатель на ген.
+    pub line_pointer: usize,
+    /// Цвет генома: кешируется, потому что считается из 16 оттенков.
+    color: u32,
+}
+
+impl CreatureGenome {
+    /// Стандартный геном из 16 генов.
+    ///
+    /// Базовый паттерн `[PhotoGrow, PhotoGrow, EatMinerals, Split]`
+    /// повторяется четыре раза.
+    pub fn standard() -> Self {
+        Self::standard_with(GENOME_LEN)
+    }
+
+    /// Стандартный геном заданной длины.
+    pub fn standard_with(len: usize) -> Self {
+        let pattern = [
+            CreatureAction::PhotoGrow,
+            CreatureAction::PhotoGrow,
+            CreatureAction::EatMinerals,
+            CreatureAction::Split,
+        ];
+
+        let line = pattern.iter().cycle().take(len.max(1)).copied().collect();
+
+        Self::from_line(line)
+    }
+
+    /// Создает геном из готовой нити ДНК.
+    ///
+    /// Пустой геном — ошибка: по нему нечего выполнять,
+    /// поэтому конструктор отказывается его создавать.
+    pub fn from_line(line: Vec<CreatureAction>) -> Self {
+        assert!(!line.is_empty(), "геном не может быть пустым");
+
+        let color = compute_genome_color(&line);
+        Self {
+            line,
+            line_pointer: 0,
+            color,
+        }
+    }
+
+    /// Гены клетки.
+    pub fn genes(&self) -> &[CreatureAction] {
+        &self.line
+    }
+
+    /// Сколько генов в геноме.
+    pub fn len(&self) -> usize {
+        self.line.len()
+    }
+
+    /// Пуст ли геном: такого генома не бывает, но проверка handy.
+    pub fn is_empty(&self) -> bool {
+        self.line.is_empty()
+    }
+
+    /// Текущий указатель на ген.
+    pub fn pointer(&self) -> usize {
+        self.line_pointer
+    }
+
+    /// Ставит указатель на ген.
+    pub fn set_pointer(&mut self, pointer: usize) {
+        self.line_pointer = pointer;
+    }
+
+    /// Цвет генома: одинаковые ДНК окрашены одинаково.
+    pub fn color(&self) -> u32 {
+        self.color
+    }
+
+    /// Копия генома с измененными генами: `(позиция, ген)`.
+    ///
+    /// Удобно собирать варианты геномов, не лезя внутрь нити.
+    pub fn with_genes(self, edits: &[(usize, CreatureAction)]) -> Self {
+        let mut genome = self;
+        for &(index, action) in edits {
+            if index < genome.line.len() {
+                genome.line[index] = action;
+            }
+        }
+        genome.recompute_color();
+        genome
+    }
+
+    /// Сдвигает указатель ДНК на `delta` (не считая обычного шага +1).
+    pub fn jump(&mut self, delta: isize) {
+        self.line_pointer = apply_jump(self.line_pointer, delta);
+    }
+
+    /// Мутирует геном одним случайным способом.
+    pub fn mutate(&mut self, rng: &mut Rng) {
+        let kind = MutationKind::ALL[rng.below(MutationKind::ALL.len())];
+        self.apply_mutation(kind, rng);
+    }
+
+    /// Мутирует геном выбранным способом.
+    ///
+    /// Так можно проверить каждый вид мутации по отдельности.
+    pub fn apply_mutation(&mut self, kind: MutationKind, rng: &mut Rng) {
+        match kind {
+            MutationKind::Insert => {
+                // Вставка нового гена в случайную позицию.
+                let index = rng.below(self.line.len() + 1);
+                self.line.insert(index, random_action(rng));
+            }
+            MutationKind::Jump => {
+                // Изменение значения Jump; если Jump нет — обычная замена гена.
+                if !self.mutate_jump_value(rng) {
+                    self.replace_gene(rng);
+                }
+            }
+            MutationKind::Remove => {
+                // Удаление гена, но геном никогда не остается пустым.
+                if self.line.len() > 1 {
+                    let index = rng.below(self.line.len());
+                    self.line.remove(index);
+                } else {
+                    self.replace_gene(rng);
+                }
+            }
+            MutationKind::Replace => self.replace_gene(rng),
+        }
+
+        self.recompute_color();
+    }
+
+    /// Заменяет случайный ген на случайный другой.
+    fn replace_gene(&mut self, rng: &mut Rng) {
+        let index = rng.below(self.line.len());
+        self.line[index] = random_action(rng);
+    }
+
+    /// Изменяет значение случайного гена Jump. Возвращает `false`, если Jump нет.
+    ///
+    /// Новое значение остается в диапазоне -4..=4 и никогда не равно нулю:
+    /// ген прыжка всегда что-то сдвигает.
+    fn mutate_jump_value(&mut self, rng: &mut Rng) -> bool {
+        let jump_positions: Vec<usize> = self
+            .line
+            .iter()
+            .enumerate()
+            .filter_map(|(index, action)| {
+                matches!(action, CreatureAction::Jump(_)).then_some(index)
+            })
+            .collect();
+
+        if jump_positions.is_empty() {
+            return false;
+        }
+
+        let index = jump_positions[rng.below(jump_positions.len())];
+        if let CreatureAction::Jump(value) = &mut self.line[index] {
+            let mut next = *value + random_jump_delta(rng);
+            if next == 0 {
+                // Нулевой прыжок бессмысленен: оставляем направление прежним.
+                next = if *value < 0 { -1 } else { 1 };
+            }
+            next = next.clamp(-4, 4);
+            if next == *value {
+                // Мутация обязана что-то менять: если не вышло — меняем знак.
+                next = -*value;
+            }
+            *value = next;
+        }
+
+        true
+    }
+
+    /// Пересчитывает кешированный цвет генома.
+    fn recompute_color(&mut self) {
+        self.color = compute_genome_color(&self.line);
+    }
+
+    /// Выдает текущее действие клетки, сдвигает указатель действия на следующий
+    pub fn get_action(&mut self) -> CreatureAction {
+        let now_pointer = self.line_pointer % self.line.len();
+        self.line_pointer += 1;
+        self.line[now_pointer]
+    }
+}
+
+// ===========================================================================
+// Клетка
+// ===========================================================================
+
+/// Клетка: геном, энергия, минералы и возраст.
+#[derive(Clone, Debug)]
+pub struct Creature {
+    /// Геном клетки.
+    pub genome: CreatureGenome,
+    /// Энергия клетки.
+    pub energy: usize,
+    /// Минералы, которые клетка съела и унесла с собой.
+    pub minerals: usize,
+    /// Возраст клетки в тиках.
+    pub age: usize,
+    /// Последнее выполненное действие: нужно для режима просмотра `action`.
+    pub last_action: Option<CreatureAction>,
+}
+
+impl Creature {
+    /// Новая клетка с указанным геномом.
+    pub fn new(genome: CreatureGenome) -> Self {
+        Self {
+            genome,
+            energy: 0,
+            minerals: 0,
+            age: 0,
+            last_action: None,
+        }
+    }
+
+    /// Делит клетку на две.
+    ///
+    /// Каждая дочерняя клетка получает по 40% изначальной энергии, остаток теряется
+    /// на само деление. Минералы делятся поровну без потерь: неделимый остаток
+    /// достается материнской клетке. Обе дочерние клетки рождаются с нулевым возрастом.
+    ///
+    /// Каждая дочерняя клетка независимо может получить мутацию генома.
+    pub fn split(&self, rng: &mut Rng, config: &Config) -> (Self, Self) {
+        let energy = self.energy * config.split_energy_share_percent / 100;
+        let minerals = self.minerals;
+
+        let m_0 = (minerals / 2) + (minerals % 2);
+        let m_1 = minerals - m_0;
+
+        let mut c_0 = Creature::new(self.genome.clone());
+        c_0.energy = energy;
+        c_0.minerals = m_0;
+
+        let mut c_1 = Creature::new(self.genome.clone());
+        c_1.energy = energy;
+        c_1.minerals = m_1;
+
+        // Дети начинают ДНК с начала: указатель матери продолжает свой.
+        c_0.genome.set_pointer(0);
+        c_1.genome.set_pointer(0);
+
+        if rng.chance_percent(config.mutation_chance_percent) {
+            c_0.genome.mutate(rng);
+        }
+        if rng.chance_percent(config.mutation_chance_percent) {
+            c_1.genome.mutate(rng);
+        }
+
+        (c_0, c_1)
+    }
+}
+
+// ===========================================================================
+// Банка
+// ===========================================================================
+
+/// Что случилось с клеткой за один тик.
+enum Fate {
+    /// Клетка остается на месте.
+    Stay(Creature),
+    /// Клетка умерла: минералы возвращаются в поле.
+    Die(Creature),
+    /// Клетка разделилась: мать остается здесь, ребенок идет в `at`.
+    Divide {
+        /// Мать, остающаяся на своей клетке.
+        mother: Creature,
+        /// Ребенок, который появится в клетке `at`.
+        child: Creature,
+        /// Клетка, в которой появится ребенок.
+        at: usize,
+    },
+}
+
+/// Банка: квадратное поле с клетками, минералами и существами.
+pub struct Jar {
+    /// Ширина и высота пространства.
+    pub size: usize,
+
+    /// Номер тика, используется для рандома.
+    pub tick: usize,
+
+    /// Слой существ.
+    pub creatures: Vec<Option<Creature>>,
+    /// Слой минералов.
+    pub minerals: Vec<usize>,
+    /// Генератор случайности для мутаций и выбора направления деления.
+    pub rng: Rng,
+    /// Настройки правил симуляции.
+    pub config: Config,
+
+    /// Клетки, занятые детьми этого тика: переиспользуется между тиками.
+    reserved: Vec<bool>,
+    /// Дети, появившиеся в этом тике: переиспользуется между тиками.
+    newborns: Vec<(usize, Creature)>,
+}
+
+impl Jar {
+    /// Jar квадратная, со случайным зерном и стандартными настройками.
+    pub fn new(size: usize) -> Self {
+        Self::with_config(size, Config::default())
+    }
+
+    /// Jar с заданными настройками и случайным зерном.
+    pub fn with_config(size: usize, config: Config) -> Self {
+        Self::build(size, config, Rng::from_time())
+    }
+
+    /// Jar с заданным зерном: два таких Jar ведут себя одинаково.
+    pub fn with_seed(size: usize, seed: u64) -> Self {
+        Self::with_config_and_seed(size, Config::default(), seed)
+    }
+
+    /// Jar с заданными настройками и зерном.
+    pub fn with_config_and_seed(size: usize, config: Config, seed: u64) -> Self {
+        Self::build(size, config, Rng::new(seed))
+    }
+
+    /// Собирает банку нужного размера.
+    fn build(size: usize, config: Config, rng: Rng) -> Self {
+        let creatures = vec![None; size * size];
+        let minerals = vec![config.initial_minerals; size * size];
+
+        Self {
+            size,
+            tick: 0,
+            creatures,
+            minerals,
+            rng,
+            config,
+            reserved: vec![false; size * size],
+            newborns: Vec::new(),
+        }
+    }
+
+    /// Создает снимок состояния мира для отрисовки.
+    pub fn snapshot(&self) -> JarSnapshot {
+        let mut snapshot = JarSnapshot::new(self.size);
+        self.snapshot_into(&mut snapshot);
+        snapshot
+    }
+
+    /// Заполняет снимок текущим состоянием мира, переиспользуя буферы.
+    pub fn snapshot_into(&self, snapshot: &mut JarSnapshot) {
+        let grid = Grid::new(self.size);
+
+        snapshot.size = self.size;
+        snapshot.tick = self.tick;
+        snapshot.minerals.clear();
+        snapshot.minerals.extend_from_slice(&self.minerals);
+        snapshot.cells.clear();
+        snapshot.cells.resize(grid.len(), CellView::EMPTY);
+
+        let mut max_minerals = 0;
+        let mut max_energy = 0;
+        let mut population = 0;
+
+        for (index, cell) in self.creatures.iter().enumerate() {
+            max_minerals = max_minerals.max(self.minerals[index]);
+
+            let Some(creature) = cell else {
+                continue;
+            };
+
+            max_energy = max_energy.max(creature.energy);
+            population += 1;
+
+            snapshot.cells[index] = CellView {
+                alive: true,
+                energy: creature.energy,
+                eaten: creature.minerals,
+                age: creature.age,
+                action: creature.last_action,
+                genome_color: Some(creature.genome.color()),
+                genome_mix: Some(genome_mix(&creature.genome)),
+            };
+        }
+
+        snapshot.max_minerals = max_minerals;
+        snapshot.max_energy = max_energy;
+        snapshot.population = population;
+    }
+
+    /// Один тик симуляции: каждая клетка выполняет свой очередной ген.
+    ///
+    /// Дети, появившиеся при делении, попадают в поле после конца тика:
+    /// поэтому результат не зависит от порядка обхода клеток.
+    pub fn simulation_step(&mut self) {
+        self.tick += 1;
+        let grid = Grid::new(self.size);
+        self.newborns.clear();
+
+        for index in 0..grid.len() {
+            let Some(mut creature) = self.creatures[index].take() else {
+                continue;
+            };
+
+            creature.age += 1;
+
+            if creature.age >= self.config.lifetime_ticks {
+                // Клетка прожила свой срок - умирает, а все ее минералы
+                // возвращаются обратно на карту.
+                self.minerals[index] += creature.minerals;
+                continue;
+            }
+
+            let action = creature.genome.get_action();
+            // Запоминаем, что именно сделала клетка: по этому видно цикл ДНК.
+            creature.last_action = Some(action);
+
+            match self.act(creature, action, index, &grid) {
+                Fate::Stay(creature) => self.creatures[index] = Some(creature),
+                Fate::Die(creature) => {
+                    // Некуда делиться - клетка умирает, а все ее минералы
+                    // возвращаются обратно на карту.
+                    self.minerals[index] += creature.minerals;
+                }
+                Fate::Divide { mother, child, at } => {
+                    self.creatures[index] = Some(mother);
+                    self.reserved[at] = true;
+                    self.newborns.push((at, child));
+                }
+            }
+        }
+
+        // Дети встают на место в конце тика: так они не выполняют действие
+        // в тот же тик, в котором родились, и не занимают место друг у друга.
+        for (at, child) in self.newborns.drain(..) {
+            self.creatures[at] = Some(child);
+            self.reserved[at] = false;
+        }
+    }
+
+    /// Свободна ли клетка для ребенка.
+    ///
+    /// Правило не зависит от порядка обхода клеток: клетка свободна,
+    /// если она пуста или если ее существо умирает в этом тике.
+    fn cell_is_free(&self, neighbor: usize, index: usize) -> bool {
+        if self.reserved[neighbor] {
+            return false;
+        }
+
+        match self.creatures[neighbor].as_ref() {
+            None => true,
+            // Сосед еще не жил в этом тике: если он доживет до конца
+            // тика, место занято.
+            Some(creature) => neighbor > index && creature.age + 1 >= self.config.lifetime_ticks,
+        }
+    }
+
+    /// Выполняет действие клетки и решает, что с ней будет.
+    fn act(
+        &mut self,
+        mut creature: Creature,
+        action: CreatureAction,
+        index: usize,
+        grid: &Grid,
+    ) -> Fate {
+        match action {
+            CreatureAction::PhotoGrow => {
+                let (x, y) = grid.xy(index);
+                creature.energy +=
+                    light_level(x, y, self.size, self.config.max_photosynthesis_energy);
+                Fate::Stay(creature)
+            }
+            CreatureAction::EatMinerals => {
+                // Есть можно, только если хватает энергии и минералов.
+                if self.minerals[index] > 0
+                    && creature.energy >= self.config.eat_minerals_energy_cost
+                {
+                    creature.energy -= self.config.eat_minerals_energy_cost;
+                    creature.minerals += 1;
+                    self.minerals[index] -= 1;
+                }
+                Fate::Stay(creature)
+            }
+            CreatureAction::Split => {
+                if creature.energy < self.config.split_energy
+                    || creature.minerals < self.config.split_minerals
+                {
+                    return Fate::Stay(creature);
+                }
+
+                // Ищем свободного соседа: в него встанет ребенок.
+                let mut free: Vec<usize> = Vec::new();
+                for neighbor in grid.neighbors4(index) {
+                    if self.cell_is_free(neighbor, index) {
+                        free.push(neighbor);
+                    }
+                }
+
+                if free.is_empty() {
+                    return Fate::Die(creature);
+                }
+
+                let at = free[self.rng.below(free.len())];
+                let (mother, child) = creature.split(&mut self.rng, &self.config);
+                Fate::Divide { mother, child, at }
+            }
+            CreatureAction::Jump(delta) => {
+                // get_action уже сдвинул указатель на +1, поэтому здесь
+                // получается итоговый сдвиг +1+X.
+                creature.genome.jump(delta);
+                Fate::Stay(creature)
+            }
+        }
+    }
+
+    /// Печатает поле в консоль: удобно для отладки симуляции.
+    pub fn print(&self) {
+        let grid = Grid::new(self.size);
+        for y in 0..self.size {
+            for x in 0..self.size {
+                if self.creatures[grid.idx(x, y)].is_none() {
+                    print!("·");
+                } else {
+                    print!("█");
+                }
+            }
+            println!();
+        }
+    }
+}
+
+/// Данные одной клетки для отрисовки и панели инспектора.
+#[derive(Clone, Copy, Debug)]
+pub struct CellView {
+    /// Есть ли в клетке существо.
+    pub alive: bool,
+    /// Энергия существа.
+    pub energy: usize,
+    /// Сколько минералов съело существо.
+    pub eaten: usize,
+    /// Возраст существа в тиках.
+    pub age: usize,
+    /// Последнее выполненное действие.
+    pub action: Option<CreatureAction>,
+    /// Цвет генома существа.
+    pub genome_color: Option<u32>,
+    /// Доли генов каждого типа в геноме.
+    pub genome_mix: Option<[u8; ActionKind::COUNT]>,
+}
+
+impl CellView {
+    /// Пустая клетка.
+    pub const EMPTY: CellView = CellView {
+        alive: false,
+        energy: 0,
+        eaten: 0,
+        age: 0,
+        action: None,
+        genome_color: None,
+        genome_mix: None,
+    };
+}
+
+/// Снимок состояния мира: все клетки разом, в виде готовых к отрисовке данных.
+#[derive(Clone, Debug)]
+pub struct JarSnapshot {
+    /// Ширина и высота снимка.
+    pub size: usize,
+    /// Номер тика, к которому относится снимок.
+    pub tick: usize,
+    /// Минералы в каждой клетке поля.
+    pub minerals: Vec<usize>,
+    /// Данные каждой клетки поля.
+    pub cells: Vec<CellView>,
+    /// Максимум минералов в поле: верхняя граница шкалы.
+    pub max_minerals: usize,
+    /// Максимум энергии в поле: верхняя граница шкалы.
+    pub max_energy: usize,
+    /// Сколько существ в поле.
+    pub population: usize,
+}
+
+impl JarSnapshot {
+    /// Пустой снимок на поле такого размера.
+    pub fn new(size: usize) -> Self {
+        Self {
+            size,
+            tick: 0,
+            minerals: Vec::new(),
+            cells: Vec::new(),
+            max_minerals: 0,
+            max_energy: 0,
+            population: 0,
+        }
+    }
+
+    /// Данные клетки по координатам.
+    pub fn cell(&self, x: usize, y: usize) -> &CellView {
+        let index = Grid::new(self.size).idx(x, y);
+        self.cells.get(index).unwrap_or(&CellView::EMPTY)
+    }
+}
+
+// ===========================================================================
+// Состав генома и цвет
+// ===========================================================================
+
+/// Доли генов каждого типа в геноме.
+///
+/// Сумма долей всегда равна 255, поэтому полоска состава генома
+/// заполняет клетку целиком.
+pub fn genome_mix(genome: &CreatureGenome) -> [u8; ActionKind::COUNT] {
+    let mut counts = [0u32; ActionKind::COUNT];
+    for action in genome.genes() {
+        counts[action.kind().index()] += 1;
+    }
+
+    let total: u32 = counts.iter().sum();
+    if total == 0 {
+        return [0; ActionKind::COUNT];
+    }
+
+    // Доли считаем с округлением вниз, а остаток отдаем тем типам,
+    // у которых дробная часть больше всего: так доля прыжков
+    // не появляется из ниоткуда.
+    let mut mix = [0u8; ActionKind::COUNT];
+    let mut sum = 0u32;
+    let mut remainders = [(0u32, 0usize); ActionKind::COUNT];
+
+    for index in 0..ActionKind::COUNT {
+        let exact = counts[index] * 255;
+        let share = exact / total;
+        mix[index] = share as u8;
+        sum += share;
+        remainders[index] = (exact % total, index);
+    }
+
+    let mut left = 255 - sum;
+    remainders.sort_by_key(|(remainder, _)| std::cmp::Reverse(*remainder));
+
+    for &(_, index) in &remainders {
+        if left == 0 {
+            break;
+        }
+        if mix[index] < 255 {
+            mix[index] += 1;
+            left -= 1;
+        }
+    }
+
+    mix
+}
+
+/// Цвет генома: взвешенная циркулярная средняя оттенков генов.
+///
+/// Насыщенность всегда 100%, поэтому смесь любых генов остается яркой
+/// и никогда не превращается в серый цвет.
+pub fn genome_color(genome: &CreatureGenome) -> u32 {
+    genome.color()
+}
+
+/// Считает цвет генома по нити генов.
+fn compute_genome_color(line: &[CreatureAction]) -> u32 {
+    let Some(first) = line.first() else {
+        return 0x00FF_FFFF;
+    };
+
+    let mut sin_sum = 0.0f32;
+    let mut cos_sum = 0.0f32;
+
+    for (i, action) in line.iter().enumerate() {
+        let weight = (i + 1) as f32;
+        let radians = action.kind().hue().to_radians();
+        sin_sum += weight * radians.sin();
+        cos_sum += weight * radians.cos();
+    }
+
+    // Если противоположные оттенки почти погасили друг друга,
+    // берем оттенок первого гена. Насыщенность все равно останется 100%.
+    let hue = if sin_sum * sin_sum + cos_sum * cos_sum < 1e-6 {
+        first.kind().hue()
+    } else {
+        sin_sum.atan2(cos_sum).to_degrees().rem_euclid(360.0)
+    };
+
+    hsv_to_rgb(hue, 1.0, 0.85)
+}
+
+/// Переводит HSV в packed RGB.
+pub fn hsv_to_rgb(hue: f32, saturation: f32, value: f32) -> u32 {
+    let h = hue.rem_euclid(360.0) / 60.0;
+    let c = value * saturation;
+    let x = c * (1.0 - (h % 2.0 - 1.0).abs());
+    let (r, g, b) = match h as u32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    let m = value - c;
+
+    rgb(
+        ((r + m) * 255.0).round() as u8,
+        ((g + m) * 255.0).round() as u8,
+        ((b + m) * 255.0).round() as u8,
+    )
+}
+
+/// Собирает packed RGB из трех каналов.
+pub fn rgb(r: u8, g: u8, b: u8) -> u32 {
+    ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
+}
+
+// ===========================================================================
+// Свет
+// ===========================================================================
+
+/// Расстояние от клетки до ближайшего края Jar.
+pub fn distance_to_edge(x: usize, y: usize, size: usize) -> usize {
+    let last = size.saturating_sub(1);
+    x.min(y)
+        .min(last.saturating_sub(x))
+        .min(last.saturating_sub(y))
+}
+
+/// Половина расстояния от края до центра — дальше света нет.
+pub fn light_reach(size: usize) -> usize {
+    (size / 4).max(1)
+}
+
+/// Сколько энергии дает фотосинтез в клетке `(x, y)`.
+///
+/// Свет идет от краев Jar к центру и полностью затухает на половине пути
+/// к центру. Чем ближе клетка к краю, тем больше энергии она получает.
+pub fn light_level(x: usize, y: usize, size: usize, max_energy: usize) -> usize {
+    let reach = light_reach(size);
+    let distance = distance_to_edge(x, y, size);
+
+    if distance >= reach {
+        return 0;
+    }
+
+    max_energy - max_energy * distance / reach
+}
+
+/// Прибавляет `delta` к указателю ДНК, не позволяя ему стать отрицательным.
+pub fn apply_jump(pointer: usize, delta: isize) -> usize {
+    let next = pointer as isize + delta;
+    if next < 0 { 0 } else { next as usize }
+}
+
+// ===========================================================================
+// Стартовые геномы
+// ===========================================================================
+
+/// Стандартный геном: верхний край.
+pub(crate) fn genome_top() -> CreatureGenome {
+    CreatureGenome::standard()
+}
+
+/// Прыжки по ДНК вместо части делений: правый край.
+pub(crate) fn genome_right() -> CreatureGenome {
+    CreatureGenome::standard().with_genes(&[
+        (3, CreatureAction::Jump(1)),
+        (7, CreatureAction::Jump(2)),
+        (11, CreatureAction::Jump(1)),
+    ])
+}
+
+/// Больше поедания минералов: нижний край.
+pub(crate) fn genome_bottom() -> CreatureGenome {
+    CreatureGenome::standard().with_genes(&[
+        (4, CreatureAction::EatMinerals),
+        (8, CreatureAction::EatMinerals),
+    ])
+}
+
+/// Больше делений: левый край.
+pub(crate) fn genome_left() -> CreatureGenome {
+    CreatureGenome::standard().with_genes(&[(2, CreatureAction::Split), (6, CreatureAction::Split)])
+}
+
+/// Размещает одинаковые геномы в указанных клетках поля.
+fn spawn(jar: &mut Jar, genome: &CreatureGenome, positions: &[(usize, usize)]) {
+    let size = jar.size;
+    for &(x, y) in positions {
+        jar.creatures[x + y * size] = Some(Creature::new(genome.clone()));
     }
 }
 
@@ -224,74 +1268,66 @@ pub(crate) fn seeded_jar() -> Jar {
     // По три клетки на каждом краю, рядом с зоной максимального света.
     spawn(
         &mut jar,
-        genome_top(),
+        &genome_top(),
         &[(mid - 1, 2), (mid, 2), (mid + 1, 2)],
     );
     spawn(
         &mut jar,
-        genome_right(),
+        &genome_right(),
         &[(size - 3, mid - 1), (size - 3, mid), (size - 3, mid + 1)],
     );
     spawn(
         &mut jar,
-        genome_bottom(),
+        &genome_bottom(),
         &[(mid - 1, size - 3), (mid, size - 3), (mid + 1, size - 3)],
     );
     spawn(
         &mut jar,
-        genome_left(),
+        &genome_left(),
         &[(2, mid - 1), (2, mid), (2, mid + 1)],
     );
 
     jar
 }
 
-/// Стандартный геном: верхний край.
-pub(crate) fn genome_top() -> CreatureGenome {
-    CreatureGenome::standard()
+// ===========================================================================
+// Интерфейс: камера, ввод, часы симуляции
+// ===========================================================================
+
+/// Направление перемещения выделения.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Direction {
+    Up,
+    Down,
+    Left,
+    Right,
 }
 
-/// Прыжки по ДНК вместо части делений: правый край.
-pub(crate) fn genome_right() -> CreatureGenome {
-    let mut genome = CreatureGenome::standard();
-    genome.line[3] = CreatureAction::Jump(1);
-    genome.line[7] = CreatureAction::Jump(2);
-    genome.line[11] = CreatureAction::Jump(1);
-    genome
-}
+impl Direction {
+    /// Сдвиг на одну клетку.
+    fn delta(self) -> (isize, isize) {
+        match self {
+            Self::Up => (0, -1),
+            Self::Down => (0, 1),
+            Self::Left => (-1, 0),
+            Self::Right => (1, 0),
+        }
+    }
 
-/// Больше поедания минералов: нижний край.
-pub(crate) fn genome_bottom() -> CreatureGenome {
-    let mut genome = CreatureGenome::standard();
-    genome.line[4] = CreatureAction::EatMinerals;
-    genome.line[8] = CreatureAction::EatMinerals;
-    genome
-}
-
-/// Больше делений: левый край.
-pub(crate) fn genome_left() -> CreatureGenome {
-    let mut genome = CreatureGenome::standard();
-    genome.line[2] = CreatureAction::Split;
-    genome.line[6] = CreatureAction::Split;
-    genome
-}
-
-/// Размещает одинаковые геномы в указанных клетках поля.
-fn spawn(jar: &mut Jar, genome: CreatureGenome, positions: &[(usize, usize)]) {
-    let size = jar.size;
-    for &(x, y) in positions {
-        jar.creatures[x + y * size] = Some(Creature {
-            genome: genome.clone(),
-            energy: 0,
-            minerals: 0,
-            age: 0,
-            last_action: None,
-        });
+    /// Направление по нажатой клавише.
+    fn from_key(key: PhysicalKey) -> Option<Self> {
+        match key {
+            PhysicalKey::Code(KeyCode::KeyW | KeyCode::ArrowUp) => Some(Self::Up),
+            PhysicalKey::Code(KeyCode::KeyS | KeyCode::ArrowDown) => Some(Self::Down),
+            PhysicalKey::Code(KeyCode::KeyA | KeyCode::ArrowLeft) => Some(Self::Left),
+            PhysicalKey::Code(KeyCode::KeyD | KeyCode::ArrowRight) => Some(Self::Right),
+            _ => None,
+        }
     }
 }
 
 /// Скорость симуляции: либо несколько тиков за кадр, либо один тик раз в несколько кадров.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Speed {
     /// Столько тиков выполнять за один кадр.
     TicksPerFrame(u32),
@@ -329,96 +1365,40 @@ impl Speed {
     }
 }
 
-/// Режим просмотра поля.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ViewMode {
-    /// Основной режим: только существа.
-    Creatures,
-    /// Только концентрация минералов.
-    Minerals,
-    /// Только энергия существ.
-    Energy,
-    /// Освещенность: свет у краев Jar и тьма в центре.
-    Light,
-    /// Цвета геномов: похожие ДНК окрашены похоже.
-    Genome,
-    /// Текущее действие каждой клетки: фотосинтез, еда, деление, прыжок.
-    Action,
-}
-
-impl ViewMode {
-    /// Следующий режим по кругу.
-    fn next(self) -> Self {
-        match self {
-            Self::Creatures => Self::Minerals,
-            Self::Minerals => Self::Energy,
-            Self::Energy => Self::Light,
-            Self::Light => Self::Genome,
-            Self::Genome => Self::Action,
-            Self::Action => Self::Creatures,
-        }
-    }
-
-    /// Подпись режима для заголовка окна.
-    pub(crate) fn label(self) -> &'static str {
-        match self {
-            Self::Creatures => "creatures",
-            Self::Minerals => "minerals",
-            Self::Energy => "energy",
-            Self::Light => "light",
-            Self::Genome => "genome",
-            Self::Action => "action",
-        }
-    }
-
-    /// Нужна ли сетка в этом режиме: без неё не видно границы клеток.
-    fn needs_grid(self) -> bool {
-        matches!(
-            self,
-            Self::Minerals | Self::Energy | Self::Genome | Self::Action
-        )
-    }
-
-    /// Рисуется ли в этом режиме контур колоний вместо сетки.
-    fn needs_outline(self) -> bool {
-        matches!(self, Self::Creatures | Self::Light)
-    }
-
-    /// Сглаживается ли в этом режиме цвет клетки между кадрами.
-    fn needs_trails(self) -> bool {
-        matches!(self, Self::Minerals | Self::Energy)
-    }
-}
-
-/// Направление перемещения выделения.
+/// Команда, которую может выполнить приложение.
+///
+/// Команды не знают про клавиши: одна и та же команда может прийти
+/// с клавиатуры, с мыши или из теста.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Direction {
-    Up,
-    Down,
-    Left,
-    Right,
+enum Command {
+    /// Поставить симуляцию на паузу или снять ее.
+    TogglePause,
+    /// Переключить режим просмотра поля.
+    NextView,
+    /// Вписать поле в окно целиком.
+    FitZoom,
+    /// Ускорить симуляцию.
+    SpeedUp,
+    /// Замедлить симуляцию.
+    SpeedDown,
+    /// Изменить масштаб на указанное число ступеней.
+    Zoom(i32),
+    /// Сдвинуть выделение на одну клетку.
+    Move(Direction),
 }
 
-impl Direction {
-    /// Сдвиг на одну клетку.
-    fn delta(self) -> (isize, isize) {
-        match self {
-            Self::Up => (0, -1),
-            Self::Down => (0, 1),
-            Self::Left => (-1, 0),
-            Self::Right => (1, 0),
-        }
-    }
-
-    /// Направление по нажатой клавише.
-    fn from_key(key: PhysicalKey) -> Option<Self> {
-        match key {
-            PhysicalKey::Code(KeyCode::KeyW | KeyCode::ArrowUp) => Some(Self::Up),
-            PhysicalKey::Code(KeyCode::KeyS | KeyCode::ArrowDown) => Some(Self::Down),
-            PhysicalKey::Code(KeyCode::KeyA | KeyCode::ArrowLeft) => Some(Self::Left),
-            PhysicalKey::Code(KeyCode::KeyD | KeyCode::ArrowRight) => Some(Self::Right),
-            _ => None,
-        }
+/// Команда по нажатой клавише.
+///
+/// Клавиши перемещения сюда не попадают: у них есть нажатие и отпускание,
+/// поэтому ими занимается [`KeyRepeat`].
+fn command_from_key(key: PhysicalKey) -> Option<Command> {
+    match key {
+        PhysicalKey::Code(KeyCode::Space) => Some(Command::TogglePause),
+        PhysicalKey::Code(KeyCode::Tab) => Some(Command::NextView),
+        PhysicalKey::Code(KeyCode::KeyF) => Some(Command::FitZoom),
+        PhysicalKey::Code(KeyCode::Equal | KeyCode::NumpadAdd) => Some(Command::SpeedUp),
+        PhysicalKey::Code(KeyCode::Minus | KeyCode::NumpadSubtract) => Some(Command::SpeedDown),
+        _ => None,
     }
 }
 
@@ -438,45 +1418,164 @@ fn repeat_interval(held_for: Duration) -> Duration {
     Duration::from_millis(interval as u64)
 }
 
-/// Помещается ли поле целиком в окно при таком размере клетки.
-fn field_fits(cell_size: u32, size: usize, width: u32, height: u32) -> bool {
-    let grid = size as u32 * cell_size;
-    grid <= width && grid <= height
+/// Нажатая клавиша перемещения и момент нажатия.
+#[derive(Clone, Copy, Debug)]
+struct HeldKey {
+    direction: Direction,
+    since: Instant,
 }
 
-/// Данные выбранной клетки для панели инспектора.
-struct CellInfo {
-    /// Координаты клетки в поле.
-    x: usize,
-    y: usize,
-    /// Есть ли в клетке существо.
-    alive: bool,
-    /// Энергия существа.
-    energy: usize,
-    /// Минералы в самой клетке.
-    minerals: usize,
-    /// Сколько минералов съело существо.
-    eaten: usize,
-    /// Возраст существа в тиках.
-    age: usize,
-    /// Доли генов каждого типа в геноме.
-    mix: Option<[u8; 4]>,
-    /// Последнее выполненное действие.
-    action: Option<CreatureAction>,
+/// Автоповтор перемещения выделения.
+///
+/// Клавиш может быть нажато несколько: удержание одной не отменяет
+/// удержание другой, поэтому набор хранится в порядке нажатия.
+#[derive(Debug)]
+struct KeyRepeat {
+    /// Нажатые клавиши, от самой старой к самой новой.
+    held: Vec<HeldKey>,
+    /// Когда сработает следующий автоповтор.
+    next_repeat: Instant,
 }
 
-/// Приложение winit: хранит Jar, раз в кадр обновляет снапшот и рисует его.
-struct App {
-    jar: Jar,
-    snapshot: JarSnapshot,
+impl KeyRepeat {
+    /// Создает автоповтор, готовый сработать немедленно.
+    fn new(now: Instant) -> Self {
+        Self {
+            held: Vec::new(),
+            next_repeat: now,
+        }
+    }
 
-    window: Option<Arc<Window>>,
-    context: Option<Context<Arc<Window>>>,
-    surface: Option<Surface<Arc<Window>, Arc<Window>>>,
+    /// Клавиша нажата: первый сдвиг и запуск автоповтора.
+    fn press(&mut self, direction: Direction, now: Instant) {
+        if !self.held.iter().any(|key| key.direction == direction) {
+            self.held.push(HeldKey {
+                direction,
+                since: now,
+            });
+        }
+        self.next_repeat = now + REPEAT_DELAY;
+    }
 
-    /// Палитра отрисовки.
-    palette: Palette,
-    /// Размер одной клетки в пикселях.
+    /// Клавиша отпущена: автоповтор по ней прекращается.
+    ///
+    /// Остальные нажатые клавиши продолжают работать.
+    fn release(&mut self, direction: Direction, now: Instant) {
+        self.held.retain(|key| key.direction != direction);
+        if !self.held.is_empty() {
+            // Новая клавиша начинает свой отсчет заново.
+            self.next_repeat = now + REPEAT_DELAY;
+        }
+    }
+
+    /// Все нажатые клавиши отпущены.
+    fn release_all(&mut self) {
+        self.held.clear();
+    }
+
+    /// Удерживается ли хоть одна клавиша.
+    fn is_held(&self) -> bool {
+        !self.held.is_empty()
+    }
+
+    /// Когда сработает следующий автоповтор.
+    fn next_repeat_at(&self) -> Option<Instant> {
+        self.held.last().map(|_| self.next_repeat)
+    }
+
+    /// Автоповтор: пока клавиша удерживается, выделение едет.
+    ///
+    /// Возвращает направление, в котором нужно сдвинуть выделение.
+    fn poll(&mut self, now: Instant) -> Option<Direction> {
+        let key = *self.held.last()?;
+        if now < self.next_repeat {
+            return None;
+        }
+
+        self.next_repeat = now + repeat_interval(now.duration_since(key.since));
+        Some(key.direction)
+    }
+}
+
+/// Часы симуляции: скорость, пауза и расписание тиков.
+///
+/// Отдельный тип от [`App`], потому что расписание тиков — это
+/// чистая арифметика, которую можно проверить без окна.
+#[derive(Debug)]
+struct SimClock {
+    /// Скорость симуляции.
+    speed: Speed,
+    /// Сколько кадров накоплено при замедленном режиме.
+    frame_accum: u32,
+    /// Приостановлена ли симуляция.
+    paused: bool,
+    /// Когда будет следующий кадр симуляции.
+    next_frame: Instant,
+}
+
+impl SimClock {
+    /// Создает часы, готовые к первому кадру.
+    fn new(now: Instant) -> Self {
+        Self {
+            speed: Speed::TicksPerFrame(1),
+            frame_accum: 0,
+            paused: false,
+            next_frame: now,
+        }
+    }
+
+    /// Сколько тиков нужно выполнить в этом кадре.
+    ///
+    /// Заодно назначает время следующего кадра.
+    fn ticks_due(&mut self, now: Instant) -> u32 {
+        if self.paused || now < self.next_frame {
+            return 0;
+        }
+
+        self.next_frame = now + FRAME_TIME;
+
+        match self.speed {
+            Speed::TicksPerFrame(n) => n,
+            Speed::FramesPerTick(n) => {
+                self.frame_accum += 1;
+                if self.frame_accum >= n {
+                    self.frame_accum = 0;
+                    1
+                } else {
+                    0
+                }
+            }
+        }
+    }
+
+    /// Ставит симуляцию на паузу или снимает ее.
+    fn toggle_pause(&mut self, now: Instant) {
+        self.paused = !self.paused;
+
+        if !self.paused {
+            // Возобновляем симуляцию сразу, не дожидаясь следующего кадра.
+            self.next_frame = now;
+        }
+    }
+
+    /// Меняет скорость симуляции.
+    fn set_speed(&mut self, speed: Speed) {
+        if speed != self.speed {
+            self.speed = speed;
+            self.frame_accum = 0;
+        }
+    }
+
+    /// Подпись скорости для заголовка окна.
+    fn speed_label(&self) -> String {
+        self.speed.label()
+    }
+}
+
+/// Камера: размер клетки, окно и положение выделения.
+#[derive(Debug)]
+struct Camera {
+    /// Текущий размер клетки в пикселях.
     cell_size: u32,
     /// Размер клетки, при котором поле целиком влезает в окно.
     fit_cell_size: u32,
@@ -485,159 +1584,39 @@ struct App {
     /// Позиция выбранной клетки.
     cursor_x: usize,
     cursor_y: usize,
-    /// Направление, которое сейчас удерживается, и момент нажатия.
-    hold: Option<(Direction, Instant)>,
-    /// Когда сработает следующий автоповтор перемещения.
-    next_repeat: Instant,
-    /// Скорость симуляции.
-    speed: Speed,
-    /// Сколько кадров накоплено при замедленном режиме.
-    frame_accum: u32,
-    /// Приостановлена ли симуляция.
-    paused: bool,
-    /// Режим просмотра поля.
-    view_mode: ViewMode,
-    /// Вспышки рождения и смерти: сколько кадров осталось каждой клетке.
-    flashes: Vec<u8>,
-    /// Цвета клеток прошлого кадра: для сглаживания шкалы в тепкартах.
-    cell_layer: Vec<u32>,
-    /// Маска существ в прошлом кадре: по ней считаются вспышки.
-    prev_creatures: Vec<bool>,
-    /// Когда последний раз обновлялся заголовок окна.
-    last_title: Instant,
-    /// Заголовок окна, который уже выведен: обновляем только при изменении.
-    title: String,
-    next_frame: Instant,
+    /// Размер поля в клетках.
+    world_size: usize,
 }
 
-impl App {
-    fn new(jar: Jar) -> Self {
-        let snapshot = jar.snapshot();
-        let size = jar.size;
-        let palette = Palette::new();
-        // Стартовая камера смотрит на верхнюю колонию: в центре банки никого нет.
-        let cursor_x = size / 2;
-        let cursor_y = 2;
+impl Camera {
+    /// Создает камеру с видом на верхнюю колонию.
+    fn new(world_size: usize, window_size: (u32, u32)) -> Self {
+        let fit_cell_size = fit_cell_size(window_size.0, window_size.1, world_size);
+
         Self {
-            jar,
-            flashes: vec![0; size * size],
-            cell_layer: vec![palette.jar_bg; size * size],
-            prev_creatures: snapshot.creatures.clone(),
-            snapshot,
-            window: None,
-            context: None,
-            surface: None,
-            palette,
-            cell_size: 8,
-            fit_cell_size: 8,
-            window_size: (800, 800),
-            cursor_x,
-            cursor_y,
-            hold: None,
-            next_repeat: Instant::now(),
-            speed: Speed::TicksPerFrame(1),
-            frame_accum: 0,
-            paused: false,
-            view_mode: ViewMode::Creatures,
-            last_title: Instant::now() - TITLE_INTERVAL,
-            title: String::new(),
-            next_frame: Instant::now(),
+            cell_size: fit_cell_size,
+            fit_cell_size,
+            window_size,
+            cursor_x: world_size / 2,
+            cursor_y: 2.min(world_size.saturating_sub(1)),
+            world_size,
         }
     }
 
-    fn request_redraw(&self) {
-        if let Some(window) = &self.window {
-            window.request_redraw();
-        }
+    /// Запоминает новое окно и пересчитывает вписанный размер клетки.
+    fn set_window_size(&mut self, width: u32, height: u32) {
+        self.window_size = (width, height);
+        self.fit_cell_size = fit_cell_size(width, height, self.world_size);
     }
 
-    /// Текст заголовка окна.
-    fn title_text(&self) -> String {
-        let pause = if self.paused { " | paused" } else { "" };
-        format!(
-            "Cells | tick {} | pop {} | zoom {} | speed {} | mode {}{}",
-            self.snapshot.tick,
-            self.snapshot.population,
-            self.zoom_label(),
-            self.speed.label(),
-            self.view_mode.label(),
-            pause
-        )
-    }
-
-    /// Масштаб относительно вписанного вида.
-    fn zoom_label(&self) -> String {
-        if !self.selection_active() {
-            return "fit".to_string();
-        }
-
-        let fit = self.fit_cell_size.max(1) as f32;
-        format!("x{:.1}", self.cell_size as f32 / fit)
-    }
-
-    /// Обновляет заголовок окна, но не чаще чем раз в `TITLE_INTERVAL`.
-    fn update_title(&mut self) {
-        let Some(window) = &self.window else {
-            return;
-        };
-
-        let now = Instant::now();
-        if now.duration_since(self.last_title) < TITLE_INTERVAL {
-            return;
-        }
-
-        let text = self.title_text();
-        if text == self.title {
-            return;
-        }
-
-        self.last_title = now;
-        self.title = text.clone();
-        window.set_title(&text);
-    }
-
-    /// Меняет скорость симуляции: delta > 0 — быстрее, delta < 0 — медленнее.
-    fn change_speed(&mut self, delta: i32) {
-        let new_speed = if delta > 0 {
-            self.speed.faster()
-        } else if delta < 0 {
-            self.speed.slower()
-        } else {
-            self.speed
-        };
-
-        if new_speed != self.speed {
-            self.speed = new_speed;
-            self.frame_accum = 0;
-            self.update_title();
-        }
-    }
-
-    /// Ставит симуляцию на паузу или снимает ее.
-    fn toggle_pause(&mut self) {
-        self.paused = !self.paused;
-
-        if !self.paused {
-            // Возобновляем симуляцию сразу, не дожидаясь следующего кадра.
-            self.next_frame = Instant::now();
-        }
-
-        self.update_title();
-    }
-
-    /// Переключает режим просмотра поля.
-    fn toggle_view_mode(&mut self) {
-        self.view_mode = self.view_mode.next();
-        self.update_title();
-        self.request_redraw();
-    }
-
-    fn zoom(&mut self, direction: i32) {
-        let step = (self.cell_size / 8).max(1) as i32;
-        let new_size = (self.cell_size as i32 + direction * step)
-            .clamp(MIN_CELL_SIZE as i32, MAX_CELL_SIZE as i32) as u32;
-
-        self.set_cell_size(new_size);
+    /// Меняет масштаб на указанное число ступеней.
+    ///
+    /// Ступени берутся из общей шкалы [`ZOOM_LEVELS`], поэтому зум
+    /// всегда обратим: шаг туда и шаг обратно дают тот же размер.
+    fn zoom(&mut self, steps: i32) {
+        let level = zoom_level(self.cell_size);
+        let target = (level as i32 + steps).clamp(0, ZOOM_LEVELS.len() as i32 - 1) as usize;
+        self.set_cell_size(ZOOM_LEVELS[target]);
     }
 
     /// Вписывает поле в окно целиком.
@@ -654,8 +1633,8 @@ impl App {
         }
 
         let (width, height) = self.window_size;
-        let was_fitting = field_fits(self.cell_size, self.snapshot.size, width, height);
-        let will_fit = field_fits(new_size, self.snapshot.size, width, height);
+        let was_fitting = field_fits(self.cell_size, self.world_size, width, height);
+        let will_fit = field_fits(new_size, self.world_size, width, height);
 
         if was_fitting && !will_fit {
             // Поле перестало помещаться: выделение появляется в центре экрана,
@@ -666,7 +1645,6 @@ impl App {
         }
 
         self.cell_size = new_size;
-        self.request_redraw();
     }
 
     /// Существует ли сейчас выделение клетки.
@@ -676,7 +1654,7 @@ impl App {
     fn selection_active(&self) -> bool {
         !field_fits(
             self.cell_size,
-            self.snapshot.size,
+            self.world_size,
             self.window_size.0,
             self.window_size.1,
         )
@@ -686,14 +1664,14 @@ impl App {
     fn center_cell(&self) -> (usize, usize) {
         let (offset_x, offset_y) = field_offset(
             (self.cursor_x, self.cursor_y),
-            self.snapshot.size,
+            self.world_size,
             self.cell_size,
             self.window_size.0,
             self.window_size.1,
         );
 
         let cell = self.cell_size.max(1) as i64;
-        let last = self.snapshot.size.saturating_sub(1) as i64;
+        let last = self.world_size.saturating_sub(1) as i64;
 
         let x = ((self.window_size.0 as i64 / 2 - offset_x) / cell).clamp(0, last) as usize;
         let y = ((self.window_size.1 as i64 / 2 - offset_y) / cell).clamp(0, last) as usize;
@@ -709,451 +1687,294 @@ impl App {
         }
 
         let (dx, dy) = direction.delta();
-        let last = self.snapshot.size.saturating_sub(1) as isize;
+        let last = self.world_size.saturating_sub(1) as isize;
 
         self.cursor_x = (self.cursor_x as isize + dx).clamp(0, last) as usize;
         self.cursor_y = (self.cursor_y as isize + dy).clamp(0, last) as usize;
-        self.request_redraw();
-    }
-
-    /// Нажата клавиша движения: первый сдвиг и запуск автоповтора.
-    fn press_direction(&mut self, direction: Direction) {
-        self.hold = Some((direction, Instant::now()));
-        self.next_repeat = Instant::now() + REPEAT_DELAY;
-        self.move_selection(direction);
-    }
-
-    /// Клавиша движения отпущена: автоповтор прекращается.
-    fn release_direction(&mut self) {
-        self.hold = None;
-    }
-
-    /// Автоповтор: пока клавиша удерживается, выделение едет.
-    fn update_repeat(&mut self, now: Instant) {
-        let Some((direction, since)) = self.hold else {
-            return;
-        };
-
-        if now < self.next_repeat {
-            return;
-        }
-
-        self.move_selection(direction);
-        self.next_repeat = now + repeat_interval(now.duration_since(since));
-    }
-
-    /// Пересчитывает вспышки рождения и смерти по разнице двух кадров.
-    fn update_flashes(&mut self) {
-        for (index, &alive) in self.snapshot.creatures.iter().enumerate() {
-            let was_alive = self.prev_creatures[index];
-            if alive != was_alive {
-                self.flashes[index] = FLASH_FRAMES;
-            } else if self.flashes[index] > 0 {
-                self.flashes[index] -= 1;
-            }
-        }
-
-        self.prev_creatures
-            .copy_from_slice(&self.snapshot.creatures);
-    }
-
-    /// Данные выбранной клетки для инспектора.
-    fn cell_info(&self) -> CellInfo {
-        let size = self.jar.size;
-        let index = self.cursor_x + self.cursor_y * size;
-
-        match &self.jar.creatures[index] {
-            Some(creature) => CellInfo {
-                x: self.cursor_x,
-                y: self.cursor_y,
-                alive: true,
-                energy: creature.energy,
-                minerals: self.jar.minerals[index],
-                eaten: creature.minerals,
-                age: creature.age,
-                mix: Some(genome_mix(&creature.genome)),
-                action: creature.last_action,
-            },
-            None => CellInfo {
-                x: self.cursor_x,
-                y: self.cursor_y,
-                alive: false,
-                energy: 0,
-                minerals: self.jar.minerals[index],
-                eaten: 0,
-                age: 0,
-                mix: None,
-                action: None,
-            },
-        }
-    }
-
-    fn render(&mut self) {
-        let Some(window) = self.window.clone() else {
-            return;
-        };
-
-        let size = window.inner_size();
-        let (Some(width), Some(height)) =
-            (NonZeroU32::new(size.width), NonZeroU32::new(size.height))
-        else {
-            return;
-        };
-
-        // Всё, что читает состояние мира, считаем до того, как взяли поверхность.
-        let selection_active = self.selection_active();
-        let info = self.cell_info();
-        let minerals: usize = self.snapshot.minerals.iter().sum();
-        let hud_top = format!(
-            "tick {}  pop {}  min {}",
-            self.snapshot.tick,
-            self.snapshot.population,
-            format_count(minerals)
-        );
-        let hud_bottom = format!(
-            "mode {}  speed {}  zoom {}{}",
-            self.view_mode.label(),
-            self.speed.label(),
-            self.zoom_label(),
-            if self.paused { "  PAUSED" } else { "" }
-        );
-
-        {
-            let Some(surface) = self.surface.as_mut() else {
-                return;
-            };
-
-            if let Err(err) = surface.resize(width, height) {
-                eprintln!("Не удалось изменить размер поверхности: {err}");
-                return;
-            }
-
-            let Ok(mut buffer) = surface.buffer_mut() else {
-                return;
-            };
-
-            let mut context = RenderContext {
-                snapshot: &self.snapshot,
-                view: self.view_mode,
-                palette: &self.palette,
-                cell_size: self.cell_size,
-                flashes: &self.flashes,
-                cell_layer: &mut self.cell_layer,
-                selection_active,
-                cursor: (self.cursor_x, self.cursor_y),
-                info,
-                hud_top,
-                hud_bottom,
-            };
-
-            let mut canvas = Canvas {
-                buffer: &mut buffer,
-                width: width.get(),
-                height: height.get(),
-            };
-            draw_snapshot(&mut canvas, &mut context);
-
-            if let Err(err) = buffer.present() {
-                eprintln!("Не удалось показать кадр: {err}");
-            }
-        }
-
-        self.update_title();
     }
 }
 
-impl ApplicationHandler for App {
-    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.window.is_some() {
-            return;
-        }
-
-        let attributes = Window::default_attributes()
-            .with_title("Cells")
-            .with_inner_size(LogicalSize::new(800.0, 800.0))
-            .with_min_inner_size(LogicalSize::new(320.0, 320.0));
-
-        let window = match event_loop.create_window(attributes) {
-            Ok(window) => Arc::new(window),
-            Err(err) => {
-                eprintln!("Не удалось создать окно: {err}");
-                event_loop.exit();
-                return;
-            }
-        };
-
-        let context = match Context::new(window.clone()) {
-            Ok(context) => context,
-            Err(err) => {
-                eprintln!("Не удалось создать softbuffer context: {err}");
-                event_loop.exit();
-                return;
-            }
-        };
-
-        let surface = match Surface::new(&context, window.clone()) {
-            Ok(surface) => surface,
-            Err(err) => {
-                eprintln!("Не удалось создать softbuffer surface: {err}");
-                event_loop.exit();
-                return;
-            }
-        };
-
-        self.window = Some(window);
-        self.context = Some(context);
-        self.surface = Some(surface);
-
-        // Стартовый вид: вся банка целиком в окне.
-        let size = self
-            .window
-            .as_ref()
-            .expect("окно только что создано")
-            .inner_size();
-        self.window_size = (size.width, size.height);
-        self.fit_cell_size = fit_cell_size(size.width, size.height, self.jar.size);
-        self.cell_size = self.fit_cell_size;
-
-        self.request_redraw();
-    }
-
-    fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
-        self.surface = None;
-        self.context = None;
-        self.window = None;
-        // Клавиша отпускания может не прийти: останавливаем автоповтор.
-        self.release_direction();
-    }
-
-    fn window_event(
-        &mut self,
-        event_loop: &ActiveEventLoop,
-        _window_id: WindowId,
-        event: WindowEvent,
-    ) {
-        match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
-            WindowEvent::Resized(size) => {
-                self.window_size = (size.width, size.height);
-                self.fit_cell_size = fit_cell_size(size.width, size.height, self.jar.size);
-                self.request_redraw();
-            }
-            WindowEvent::RedrawRequested => self.render(),
-            WindowEvent::Focused(false) => {
-                // При потере фокуса окно не пришлёт отпускание клавиши.
-                self.release_direction();
-            }
-            WindowEvent::KeyboardInput { event, .. } => {
-                // Клавиши перемещения работают в обоих состояниях:
-                // нажатие двигает выделение, отпускание останавливает автоповтор.
-                if let Some(direction) = Direction::from_key(event.physical_key) {
-                    match event.state {
-                        ElementState::Pressed => {
-                            // Системный автоповтор игнорируем: свой считаем сами,
-                            // иначе выделение сдвигалось бы на две клетки.
-                            if !event.repeat {
-                                self.press_direction(direction);
-                            }
-                        }
-                        ElementState::Released => self.release_direction(),
-                    }
-                    return;
-                }
-
-                if event.state == ElementState::Pressed {
-                    match event.physical_key {
-                        PhysicalKey::Code(KeyCode::Space) => self.toggle_pause(),
-                        PhysicalKey::Code(KeyCode::Tab) => self.toggle_view_mode(),
-                        PhysicalKey::Code(KeyCode::KeyF) => self.fit_zoom(),
-                        PhysicalKey::Code(KeyCode::Equal | KeyCode::NumpadAdd) => {
-                            self.change_speed(1)
-                        }
-                        PhysicalKey::Code(KeyCode::Minus | KeyCode::NumpadSubtract) => {
-                            self.change_speed(-1)
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            WindowEvent::MouseWheel { delta, .. } => {
-                let scroll = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => y,
-                    MouseScrollDelta::PixelDelta(position) => position.y as f32 / 50.0,
-                };
-
-                if scroll > 0.0 {
-                    self.zoom(1);
-                } else if scroll < 0.0 {
-                    self.zoom(-1);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        let now = Instant::now();
-
-        // Автоповтор перемещения работает и на паузе.
-        self.update_repeat(now);
-
-        if self.paused {
-            // На паузе спим, но если клавиша удерживается, просыпаемся ради неё.
-            if self.hold.is_some() {
-                event_loop.set_control_flow(ControlFlow::WaitUntil(self.next_repeat));
-            } else {
-                event_loop.set_control_flow(ControlFlow::Wait);
-            }
-            return;
-        }
-
-        if now >= self.next_frame {
-            let stepped = match self.speed {
-                Speed::TicksPerFrame(n) => {
-                    for _ in 0..n {
-                        self.jar.simulation_step();
-                    }
-                    true
-                }
-                Speed::FramesPerTick(n) => {
-                    self.frame_accum += 1;
-                    if self.frame_accum >= n {
-                        self.frame_accum = 0;
-                        self.jar.simulation_step();
-                        true
-                    } else {
-                        false
-                    }
-                }
-            };
-
-            if stepped {
-                self.snapshot = self.jar.snapshot();
-                self.update_flashes();
-                self.request_redraw();
-            }
-            self.next_frame = now + FRAME_TIME;
-        }
-
-        // Просыпаемся на кадр симуляции или на момент автоповтора — что раньше.
-        let mut wake = self.next_frame;
-        if self.hold.is_some() && self.next_repeat < wake {
-            wake = self.next_repeat;
-        }
-        event_loop.set_control_flow(ControlFlow::WaitUntil(wake));
-    }
-}
-
-/// Всё, что нужно для отрисовки одного кадра.
-struct RenderContext<'a> {
-    /// Снимок состояния мира.
-    snapshot: &'a JarSnapshot,
-    /// Режим просмотра поля.
-    view: ViewMode,
-    /// Палитра отрисовки.
-    palette: &'a Palette,
-    /// Размер клетки в пикселях.
-    cell_size: u32,
-    /// Вспышки рождения и смерти по клеткам.
-    flashes: &'a [u8],
-    /// Цвета клеток прошлого кадра: нужны для сглаживания шкалы.
-    cell_layer: &'a mut Vec<u32>,
-    /// Есть ли сейчас выделение клетки.
-    selection_active: bool,
-    /// Выбранная клетка.
-    cursor: (usize, usize),
-    /// Данные выбранной клетки для инспектора.
-    info: CellInfo,
-    /// Строки панели HUD.
-    hud_top: String,
-    /// Вторая строка панели HUD.
-    hud_bottom: String,
-}
-
-/// Смещение поля в пикселях.
-///
-/// Если поле влезает в окно целиком, оно центрируется, иначе камера
-/// следует за курсором, который всегда остается в середине экрана.
-fn field_offset(
-    cursor: (usize, usize),
-    size: usize,
-    cell_size: u32,
-    width: u32,
-    height: u32,
-) -> (i64, i64) {
-    let cell = cell_size.max(1) as i64;
-    let grid = size as i64 * cell;
-
-    let offset_x = if grid <= width as i64 {
-        (width as i64 - grid) / 2
-    } else {
-        width as i64 / 2 - (cursor.0 as i64 * cell + cell / 2)
-    };
-    let offset_y = if grid <= height as i64 {
-        (height as i64 - grid) / 2
-    } else {
-        height as i64 / 2 - (cursor.1 as i64 * cell + cell / 2)
-    };
-
-    (offset_x, offset_y)
+/// Помещается ли поле целиком в окно при таком размере клетки.
+fn field_fits(cell_size: u32, size: usize, width: u32, height: u32) -> bool {
+    let grid = size as u32 * cell_size;
+    grid <= width && grid <= height
 }
 
 /// Размер клетки, при котором поле целиком влезает в окно.
+///
+/// Берутся только ступени общей шкалы зума: так вписанный вид
+/// всегда совпадает с одним из режимов масштаба.
 fn fit_cell_size(width: u32, height: u32, size: usize) -> u32 {
-    let side = width.min(height) / size.max(1) as u32;
-    side.clamp(MIN_CELL_SIZE, MAX_CELL_SIZE)
+    let limit = width.min(height) / size.max(1) as u32;
+
+    let mut best = MIN_CELL_SIZE;
+    for &level in ZOOM_LEVELS.iter() {
+        if level <= limit {
+            best = level;
+        }
+    }
+
+    best.clamp(MIN_CELL_SIZE, MAX_CELL_SIZE)
 }
 
-/// Рисует кадр в буфер: обёртка для инструментов и тестов.
+/// Номер ступени зума для размера клетки.
+fn zoom_level(cell_size: u32) -> usize {
+    let mut best = 0;
+    let mut best_distance = u32::MAX;
+
+    for (index, &level) in ZOOM_LEVELS.iter().enumerate() {
+        let distance = level.abs_diff(cell_size);
+        if distance < best_distance {
+            best_distance = distance;
+            best = index;
+        }
+    }
+
+    best
+}
+
+// ===========================================================================
+// Отрисовка
+// ===========================================================================
+
+/// Режим просмотра поля.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ViewMode {
+    /// Основной режим: только существа.
+    Creatures,
+    /// Только концентрация минералов.
+    Minerals,
+    /// Только энергия существ.
+    Energy,
+    /// Освещенность: свет у краев Jar и тьма в центре.
+    Light,
+    /// Цвета геномов: похожие ДНК окрашены похоже.
+    Genome,
+    /// Текущее действие каждой клетки: фотосинтез, еда, деление, прыжок.
+    Action,
+}
+
+impl ViewMode {
+    /// Все режимы в порядке переключения.
+    pub(crate) const ALL: [ViewMode; 6] = [
+        Self::Creatures,
+        Self::Minerals,
+        Self::Energy,
+        Self::Light,
+        Self::Genome,
+        Self::Action,
+    ];
+
+    /// Следующий режим по кругу.
+    fn next(self) -> Self {
+        let index = Self::ALL.iter().position(|mode| *mode == self).unwrap_or(0);
+        Self::ALL[(index + 1) % Self::ALL.len()]
+    }
+
+    /// Описание режима: как его показывать.
+    fn spec(self) -> &'static ViewSpec {
+        &VIEW_SPECS[Self::ALL.iter().position(|mode| *mode == self).unwrap_or(0)]
+    }
+
+    /// Подпись режима для заголовка окна.
+    pub(crate) fn label(self) -> &'static str {
+        self.spec().label
+    }
+}
+
+/// Дополнительный слой поверх клеток в некотором режиме.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Overlay {
+    /// Затемнение по освещенности поля.
+    Light,
+}
+
+/// Декор внутри клетки в некотором режиме.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Decor {
+    /// Полоска состава генома внизу клетки.
+    GenomeBar,
+}
+
+/// Как нарисовать клетку в этом режиме.
+type ColorFn = fn(&JarSnapshot, usize, &Palette) -> u32;
+
+/// Как нарисовать легенду шкалы в этом режиме.
+type LegendFn = fn(&JarSnapshot) -> (&'static [Stop], usize);
+
+/// Описание режима просмотра.
 ///
-/// Собирает контекст с нейтральными значениями: без указателя мыши,
-/// без вспышек и с пустым инспектором.
-#[allow(dead_code)]
-pub(crate) fn draw_frame(
-    buffer: &mut [u32],
-    width: u32,
-    height: u32,
-    snapshot: &JarSnapshot,
-    view: ViewMode,
-    cell_size: u32,
-    cursor: (usize, usize),
-) {
-    let palette = Palette::new();
-    let flashes = vec![0u8; snapshot.creatures.len()];
-    let mut cell_layer = vec![palette.jar_bg; snapshot.creatures.len()];
-    let index = cursor.0 + cursor.1 * snapshot.size;
-    let info = CellInfo {
-        x: cursor.0,
-        y: cursor.1,
-        alive: snapshot.creatures.get(index).copied().unwrap_or(false),
-        energy: snapshot.energies.get(index).copied().unwrap_or(0),
-        minerals: snapshot.minerals.get(index).copied().unwrap_or(0),
-        eaten: 0,
-        age: 0,
-        mix: snapshot.genome_mix.get(index).copied().flatten(),
-        action: snapshot.actions.get(index).copied().flatten(),
-    };
+/// Новый режим просмотра — это одна запись здесь плюс функция цвета:
+/// больше нигде не нужно вспоминать про конкретные режимы.
+struct ViewSpec {
+    /// Подпись режима.
+    label: &'static str,
+    /// Нужна ли сетка: без нее не видно границы клеток.
+    grid: bool,
+    /// Рисуется ли контур колоний вместо сетки.
+    outline: bool,
+    /// Сглаживается ли цвет клетки между кадрами.
+    trails: bool,
+    /// Цвет клетки в этом режиме.
+    color: ColorFn,
+    /// Легенда шкалы, если она есть.
+    legend: Option<LegendFn>,
+    /// Слой поверх клеток, если он есть.
+    overlay: Option<Overlay>,
+    /// Декор внутри клетки, если он есть.
+    decor: Option<Decor>,
+}
 
-    let mut context = RenderContext {
-        snapshot,
-        view,
-        palette: &palette,
-        cell_size,
-        flashes: &flashes,
-        cell_layer: &mut cell_layer,
-        selection_active: !field_fits(cell_size, snapshot.size, width, height),
-        cursor,
-        info,
-        hud_top: format!("tick {}  pop {}", snapshot.tick, snapshot.population),
-        hud_bottom: format!("mode {}", view.label()),
-    };
+/// Описания всех режимов просмотра.
+static VIEW_SPECS: [ViewSpec; 6] = [
+    ViewSpec {
+        label: "creatures",
+        grid: false,
+        outline: true,
+        trails: false,
+        color: color_creatures,
+        legend: None,
+        overlay: None,
+        decor: None,
+    },
+    ViewSpec {
+        label: "minerals",
+        grid: true,
+        outline: false,
+        trails: true,
+        color: color_minerals,
+        legend: Some(legend_minerals),
+        overlay: None,
+        decor: None,
+    },
+    ViewSpec {
+        label: "energy",
+        grid: true,
+        outline: false,
+        trails: true,
+        color: color_energy,
+        legend: Some(legend_energy),
+        overlay: None,
+        decor: None,
+    },
+    ViewSpec {
+        label: "light",
+        grid: false,
+        outline: true,
+        trails: false,
+        color: color_light,
+        legend: None,
+        overlay: Some(Overlay::Light),
+        decor: None,
+    },
+    ViewSpec {
+        label: "genome",
+        grid: true,
+        outline: false,
+        trails: false,
+        color: color_genome,
+        legend: None,
+        overlay: None,
+        decor: Some(Decor::GenomeBar),
+    },
+    ViewSpec {
+        label: "action",
+        grid: true,
+        outline: false,
+        trails: false,
+        color: color_action,
+        legend: None,
+        overlay: None,
+        decor: None,
+    },
+];
 
-    let mut canvas = Canvas {
-        buffer,
-        width,
-        height,
-    };
-    draw_snapshot(&mut canvas, &mut context);
+/// Цвет клетки в режиме существ.
+fn color_creatures(snapshot: &JarSnapshot, index: usize, palette: &Palette) -> u32 {
+    if !snapshot.cells[index].alive {
+        return palette.jar_bg;
+    }
+    // Чем больше энергии, тем светлее клетка.
+    let energy = snapshot.cells[index].energy.min(100) as u32;
+    mix(palette.creature, 0x00FF_FFFF, energy * 80 / 100)
+}
+
+/// Цвет клетки в режиме освещенности: тот же цвет, что и в режиме существ.
+fn color_light(snapshot: &JarSnapshot, index: usize, palette: &Palette) -> u32 {
+    color_creatures(snapshot, index, palette)
+}
+
+/// Цвет клетки в режиме минералов.
+fn color_minerals(snapshot: &JarSnapshot, index: usize, _palette: &Palette) -> u32 {
+    let max = snapshot.max_minerals.max(1) as u32;
+    let amount = snapshot.minerals[index].min(max as usize) as u32;
+    ramp(amount * 255 / max, &MINERAL_RAMP)
+}
+
+/// Цвет клетки в режиме энергии.
+fn color_energy(snapshot: &JarSnapshot, index: usize, palette: &Palette) -> u32 {
+    if !snapshot.cells[index].alive {
+        return palette.jar_bg;
+    }
+    let max = snapshot.max_energy.max(1) as u32;
+    let amount = snapshot.cells[index].energy.min(max as usize) as u32;
+    ramp(amount * 255 / max, &ENERGY_RAMP)
+}
+
+/// Цвет клетки в режиме геномов.
+fn color_genome(snapshot: &JarSnapshot, index: usize, palette: &Palette) -> u32 {
+    snapshot.cells[index].genome_color.unwrap_or(palette.jar_bg)
+}
+
+/// Цвет клетки в режиме действий.
+fn color_action(snapshot: &JarSnapshot, index: usize, palette: &Palette) -> u32 {
+    match snapshot.cells[index].action {
+        Some(action) => palette.action_colors[action.kind().index()],
+        None => palette.jar_bg,
+    }
+}
+
+/// Легенда шкалы минералов.
+fn legend_minerals(snapshot: &JarSnapshot) -> (&'static [Stop], usize) {
+    (&MINERAL_RAMP, snapshot.max_minerals)
+}
+
+/// Легенда шкалы энергии.
+fn legend_energy(snapshot: &JarSnapshot) -> (&'static [Stop], usize) {
+    (&ENERGY_RAMP, snapshot.max_energy)
+}
+
+/// Цвет клетки в текущем режиме просмотра.
+fn cell_color(snapshot: &JarSnapshot, index: usize, view: ViewMode, palette: &Palette) -> u32 {
+    (view.spec().color)(snapshot, index, palette)
+}
+
+/// Положение панели относительно окна.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Anchor {
+    /// Левый верхний угол.
+    TopLeft,
+    /// Правый верхний угол.
+    TopRight,
+    /// Левый нижний угол.
+    BottomLeft,
+    /// Правый нижний угол.
+    BottomRight,
+}
+
+impl Anchor {
+    /// Положение панели размером `size` в окне `window` с отступом `margin`.
+    fn place(self, window: (u32, u32), size: (u32, u32), margin: u32) -> (i64, i64) {
+        let x = match self {
+            Self::TopLeft | Self::BottomLeft => margin as i64,
+            Self::TopRight | Self::BottomRight => window.0 as i64 - size.0 as i64 - margin as i64,
+        };
+        let y = match self {
+            Self::TopLeft | Self::TopRight => margin as i64,
+            Self::BottomLeft | Self::BottomRight => window.1 as i64 - size.1 as i64 - margin as i64,
+        };
+        (x, y)
+    }
 }
 
 /// Поверхность отрисовки: буфер пикселей и его размеры.
@@ -1185,6 +2006,79 @@ impl Canvas<'_> {
         }
     }
 
+    /// Рисует рамку вокруг прямоугольника толщиной в `thickness` пикселей.
+    fn stroke_rect(
+        &mut self,
+        x: i64,
+        y: i64,
+        rect_width: u32,
+        rect_height: u32,
+        thickness: u32,
+        color: u32,
+    ) {
+        let thickness = thickness.max(1);
+
+        self.fill_rect(x, y, rect_width, thickness, color);
+        self.fill_rect(
+            x,
+            y + rect_height as i64 - thickness as i64,
+            rect_width,
+            thickness,
+            color,
+        );
+        self.fill_rect(x, y, thickness, rect_height, color);
+        self.fill_rect(
+            x + rect_width as i64 - thickness as i64,
+            y,
+            thickness,
+            rect_height,
+            color,
+        );
+    }
+
+    /// Рисует четыре уголка по краям квадрата со стороной `size`.
+    ///
+    /// Содержимое квадрата не закрашивается: рамка только обозначает границы.
+    fn corner_brackets(&mut self, x: i64, y: i64, size: i64, arm: i64, thickness: i64, color: u32) {
+        let arm = arm.max(1).min(size.max(1));
+        let thickness = thickness.max(1);
+
+        // Левый верхний угол.
+        self.fill_rect(x, y, arm as u32, thickness as u32, color);
+        self.fill_rect(x, y, thickness as u32, arm as u32, color);
+        // Правый верхний.
+        self.fill_rect(x + size - arm, y, arm as u32, thickness as u32, color);
+        self.fill_rect(x + size - thickness, y, thickness as u32, arm as u32, color);
+        // Левый нижний.
+        self.fill_rect(x, y + size - thickness, arm as u32, thickness as u32, color);
+        self.fill_rect(x, y + size - arm, thickness as u32, arm as u32, color);
+        // Правый нижний.
+        self.fill_rect(
+            x + size - arm,
+            y + size - thickness,
+            arm as u32,
+            thickness as u32,
+            color,
+        );
+        self.fill_rect(
+            x + size - thickness,
+            y + size - arm,
+            thickness as u32,
+            arm as u32,
+            color,
+        );
+    }
+
+    /// Читает пиксель. За пределами окна возвращает `None`.
+    fn pixel_at(&self, x: i64, y: i64) -> Option<u32> {
+        if x < 0 || y < 0 || x >= self.width as i64 || y >= self.height as i64 {
+            return None;
+        }
+        self.buffer
+            .get((y as u32 * self.width + x as u32) as usize)
+            .copied()
+    }
+
     /// Рисует один пиксель.
     fn pixel(&mut self, x: i64, y: i64, color: u32) {
         if x < 0 || y < 0 || x >= self.width as i64 || y >= self.height as i64 {
@@ -1194,16 +2088,289 @@ impl Canvas<'_> {
         self.buffer[(y as u32 * self.width + x as u32) as usize] = color;
     }
 
+    /// Перекрашивает пиксель в цвет, посчитанный от старого.
+    ///
+    /// За пределами окна ничего не происходит: буфер никогда не
+    /// индексируется вслепую.
+    fn shade_pixel(&mut self, x: i64, y: i64, shade: impl Fn(u32) -> u32) {
+        let Some(current) = self.pixel_at(x, y) else {
+            return;
+        };
+        self.pixel(x, y, shade(current));
+    }
+
     /// Заливает весь буфер цветом.
     fn fill(&mut self, color: u32) {
         self.buffer.fill(color);
     }
 }
 
+/// Положение поля в окне: смещение, размер клетки и размер поля.
+struct Viewport {
+    /// Смещение поля по горизонтали в пикселях.
+    offset_x: i64,
+    /// Смещение поля по вертикали в пикселях.
+    offset_y: i64,
+    /// Размер клетки в пикселях.
+    cell: u32,
+    /// Размер поля в пикселях.
+    grid: u32,
+    /// Размер поля в клетках.
+    size: usize,
+}
+
+impl Viewport {
+    /// Левый верхний угол клетки в пикселях окна.
+    fn cell_origin(&self, x: usize, y: usize) -> (i64, i64) {
+        (
+            self.offset_x + (x as u32 * self.cell) as i64,
+            self.offset_y + (y as u32 * self.cell) as i64,
+        )
+    }
+
+    /// Диапазон клеток, которые попадают в окно: `(x0, x1, y0, y1)`.
+    ///
+    /// Нужен, чтобы не закрашивать все десять тысяч клеток,
+    /// когда в окно видно только сотню.
+    fn visible_cells(&self, width: u32, height: u32) -> (usize, usize, usize, usize) {
+        let cell = self.cell.max(1) as i64;
+
+        let x0 = ((-self.offset_x).max(0) / cell) as usize;
+        let y0 = ((-self.offset_y).max(0) / cell) as usize;
+        let x1 = (((width as i64 - self.offset_x).max(0) + cell - 1) / cell) as usize;
+        let y1 = (((height as i64 - self.offset_y).max(0) + cell - 1) / cell) as usize;
+
+        (
+            x0.min(self.size),
+            x1.min(self.size),
+            y0.min(self.size),
+            y1.min(self.size),
+        )
+    }
+}
+
+/// Смещение поля в пикселях.
+///
+/// Если поле влезает в окно целиком, оно центрируется, иначе камера
+/// следует за курсором, который всегда остается в середине экрана.
+fn field_offset(
+    cursor: (usize, usize),
+    size: usize,
+    cell_size: u32,
+    width: u32,
+    height: u32,
+) -> (i64, i64) {
+    let cell = cell_size.max(1) as i64;
+    let grid = size as i64 * cell;
+
+    let offset_x = if grid <= width as i64 {
+        (width as i64 - grid) / 2
+    } else {
+        width as i64 / 2 - (cursor.0 as i64 * cell + cell / 2)
+    };
+    let offset_y = if grid <= height as i64 {
+        (height as i64 - grid) / 2
+    } else {
+        height as i64 / 2 - (cursor.1 as i64 * cell + cell / 2)
+    };
+
+    (offset_x, offset_y)
+}
+
+/// Всё, что нужно для отрисовки одного кадра.
+struct RenderContext<'a> {
+    /// Снимок состояния мира.
+    snapshot: &'a JarSnapshot,
+    /// Режим просмотра поля.
+    view: ViewMode,
+    /// Палитра отрисовки.
+    palette: &'a Palette,
+    /// Размер клетки в пикселях.
+    cell_size: u32,
+    /// Вспышки рождения и смерти по клеткам.
+    flashes: &'a [u8],
+    /// Цвета клеток прошлого кадра: нужны для сглаживания шкалы.
+    cell_layer: &'a mut Vec<u32>,
+    /// Есть ли сейчас выделение клетки.
+    selection_active: bool,
+    /// Выбранная клетка.
+    cursor: (usize, usize),
+    /// Данные выбранной клетки для инспектора.
+    info: CellInfo,
+    /// Строки панели HUD.
+    hud_top: String,
+    /// Вторая строка панели HUD.
+    hud_bottom: String,
+}
+
+/// Данные выбранной клетки для панели инспектора.
+struct CellInfo {
+    /// Координаты клетки в поле.
+    x: usize,
+    y: usize,
+    /// Есть ли в клетке существо.
+    alive: bool,
+    /// Энергия существа.
+    energy: usize,
+    /// Минералы в самой клетке.
+    minerals: usize,
+    /// Сколько минералов съело существо.
+    eaten: usize,
+    /// Возраст существа в тиках.
+    age: usize,
+    /// Доли генов каждого типа в геноме.
+    mix: Option<[u8; ActionKind::COUNT]>,
+    /// Последнее выполненное действие.
+    action: Option<CreatureAction>,
+}
+
+impl CellInfo {
+    /// Собирает данные клетки из снимка мира.
+    fn from_snapshot(snapshot: &JarSnapshot, x: usize, y: usize) -> Self {
+        let index = Grid::new(snapshot.size).idx(x, y);
+        let cell = snapshot
+            .cells
+            .get(index)
+            .copied()
+            .unwrap_or(CellView::EMPTY);
+
+        Self {
+            x,
+            y,
+            alive: cell.alive,
+            energy: cell.energy,
+            minerals: snapshot.minerals.get(index).copied().unwrap_or(0),
+            eaten: cell.eaten,
+            age: cell.age,
+            mix: cell.genome_mix,
+            action: cell.action,
+        }
+    }
+}
+
+/// Строки панели HUD.
+fn hud_lines(
+    snapshot: &JarSnapshot,
+    view: ViewMode,
+    speed: &str,
+    zoom: &str,
+    paused: bool,
+) -> [String; 2] {
+    let minerals: usize = snapshot.minerals.iter().sum();
+
+    [
+        format!(
+            "tick {}  pop {}  min {}",
+            snapshot.tick,
+            snapshot.population,
+            format_count(minerals)
+        ),
+        format!(
+            "mode {}  speed {}  zoom {}{}",
+            view.label(),
+            speed,
+            zoom,
+            if paused { "  PAUSED" } else { "" }
+        ),
+    ]
+}
+
+/// Строки панели инспектора.
+fn inspector_lines(info: &CellInfo) -> Vec<String> {
+    let mut lines = vec![format!("cell {},{}", info.x, info.y)];
+
+    if info.alive {
+        lines.push(format!("energy {}  minerals {}", info.energy, info.eaten));
+        lines.push(format!(
+            "age {}  action {}",
+            info.age,
+            action_label(info.action)
+        ));
+        lines.push(format!("dna {}", mix_label(info.mix)));
+    } else {
+        lines.push("empty".to_string());
+        lines.push(format!("minerals {}", info.minerals));
+    }
+
+    lines
+}
+
+/// Рисует кадр в буфер: обёртка для инструментов и тестов.
+///
+/// Собирает контекст с нейтральными значениями: без указателя мыши,
+/// без вспышек и с пустым инспектором.
+#[allow(dead_code)]
+pub(crate) fn draw_frame(
+    buffer: &mut [u32],
+    width: u32,
+    height: u32,
+    snapshot: &JarSnapshot,
+    view: ViewMode,
+    cell_size: u32,
+    cursor: (usize, usize),
+) {
+    let palette = Palette::new();
+    let mut cell_layer = vec![palette.jar_bg; snapshot.size * snapshot.size];
+
+    draw_frame_with_layer(
+        buffer,
+        width,
+        height,
+        snapshot,
+        view,
+        cell_size,
+        cursor,
+        &mut cell_layer,
+    );
+}
+
+/// Рисует кадр, сохраняя предыдущие цвета клеток.
+///
+/// Слой нужен для сглаживания шкалы: он живет между кадрами,
+/// поэтому цвет клетки догоняет новые данные постепенно.
+#[allow(dead_code, clippy::too_many_arguments)]
+pub(crate) fn draw_frame_with_layer(
+    buffer: &mut [u32],
+    width: u32,
+    height: u32,
+    snapshot: &JarSnapshot,
+    view: ViewMode,
+    cell_size: u32,
+    cursor: (usize, usize),
+    cell_layer: &mut Vec<u32>,
+) {
+    let palette = Palette::new();
+    let flashes = vec![0u8; snapshot.size * snapshot.size];
+    let info = CellInfo::from_snapshot(snapshot, cursor.0, cursor.1);
+    let [hud_top, hud_bottom] = hud_lines(snapshot, view, "x1", "fit", false);
+
+    let mut context = RenderContext {
+        snapshot,
+        view,
+        palette: &palette,
+        cell_size,
+        flashes: &flashes,
+        cell_layer,
+        selection_active: !field_fits(cell_size, snapshot.size, width, height),
+        cursor,
+        info,
+        hud_top,
+        hud_bottom,
+    };
+
+    let mut canvas = Canvas {
+        buffer,
+        width,
+        height,
+    };
+    draw_snapshot(&mut canvas, &mut context);
+}
+
 /// Рисует кадр: слои идут снизу вверх, порядок задан в плане.
 fn draw_snapshot(canvas: &mut Canvas, context: &mut RenderContext) {
     let palette = context.palette;
     let snapshot = context.snapshot;
+    let spec = context.view.spec();
     let cell = context.cell_size.max(1);
     let grid = snapshot.size as u32 * cell;
     let (offset_x, offset_y) = field_offset(
@@ -1214,6 +2381,14 @@ fn draw_snapshot(canvas: &mut Canvas, context: &mut RenderContext) {
         canvas.height,
     );
 
+    let viewport = Viewport {
+        offset_x,
+        offset_y,
+        cell,
+        grid,
+        size: snapshot.size,
+    };
+
     // 0. фон окна вокруг банки
     canvas.fill(palette.window_bg);
 
@@ -1221,10 +2396,10 @@ fn draw_snapshot(canvas: &mut Canvas, context: &mut RenderContext) {
     canvas.fill_rect(offset_x, offset_y, grid, grid, palette.jar_bg);
 
     // 2. содержимое клеток
-    draw_cells(canvas, context, offset_x, offset_y, cell);
+    draw_cells(canvas, context, &viewport);
 
     // 3. сетка: только там, где без неё не видно границы клеток
-    if context.view.needs_grid() {
+    if spec.grid {
         draw_grid(
             canvas,
             snapshot.size,
@@ -1236,31 +2411,26 @@ fn draw_snapshot(canvas: &mut Canvas, context: &mut RenderContext) {
     }
 
     // 4. контур колоний вместо сетки
-    if context.view.needs_outline() {
-        draw_colony_outline(
-            canvas,
-            snapshot,
-            offset_x,
-            offset_y,
-            cell,
-            palette.jar_frame,
-        );
+    if spec.outline {
+        draw_colony_outline(canvas, snapshot, &viewport, palette.jar_frame);
     }
 
-    // 5. оверлей освещенности
-    if context.view == ViewMode::Light {
-        draw_light_overlay(canvas, offset_x, offset_y, grid, cell, snapshot.size);
+    // 5. оверлей поверх клеток
+    match spec.overlay {
+        Some(Overlay::Light) => draw_light_overlay(canvas, &viewport),
+        None => {}
     }
+
     // 6. рамка банки и внутренняя тень
     draw_jar_frame(canvas, offset_x, offset_y, grid, palette);
 
     // 7. курсор: пока поле помещается в окно, выделения нет
     if context.selection_active {
-        draw_cursor(canvas, context, offset_x, offset_y, cell);
+        draw_cursor(canvas, context, &viewport);
     }
 
     // 8. оверлеи интерфейса
-    draw_minimap(canvas, context, offset_x, offset_y, cell);
+    draw_minimap(canvas, context, &viewport);
     draw_hud(canvas, context);
     draw_legend(canvas, context);
     if context.selection_active {
@@ -1269,27 +2439,24 @@ fn draw_snapshot(canvas: &mut Canvas, context: &mut RenderContext) {
 }
 
 /// Рисует содержимое клеток поля.
-fn draw_cells(
-    canvas: &mut Canvas,
-    context: &mut RenderContext,
-    offset_x: i64,
-    offset_y: i64,
-    cell: u32,
-) {
+fn draw_cells(canvas: &mut Canvas, context: &mut RenderContext, viewport: &Viewport) {
     let snapshot = context.snapshot;
-    let view = context.view;
+    let spec = context.view.spec();
     let palette = context.palette;
     let flashes = context.flashes;
     let layer = &mut *context.cell_layer;
+    let size = snapshot.size;
 
-    for y in 0..snapshot.size {
-        for x in 0..snapshot.size {
-            let index = x + y * snapshot.size;
-            let mut color = cell_color(snapshot, index, view, palette);
+    // Цвета считаем для всех клеток: так сглаживание не зависит от того,
+    // какие клетки сейчас видны в окне. Рисуем только видимые.
+    for y in 0..size {
+        for x in 0..size {
+            let index = Grid::new(size).idx(x, y);
+            let mut color = (spec.color)(snapshot, index, palette);
 
             // В режимах-тепкартах цвет плавно догоняет новые данные:
             // скачок минералов или энергии не выглядит как вспышка.
-            if view.needs_trails() {
+            if spec.trails {
                 color = mix(layer[index], color, TRAIL_SPEED);
             }
             layer[index] = color;
@@ -1301,15 +2468,31 @@ fn draw_cells(
                 let strength = (*flash as u32) * FLASH_STRENGTH / FLASH_FRAMES as u32;
                 color = mix(color, 0x00FF_FFFF, strength);
             }
+        }
+    }
 
-            let px = offset_x + (x as u32 * cell) as i64;
-            let py = offset_y + (y as u32 * cell) as i64;
-            canvas.fill_rect(px, py, cell, cell, color);
+    let (x0, x1, y0, y1) = viewport.visible_cells(canvas.width, canvas.height);
+
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let index = Grid::new(size).idx(x, y);
+            let mut color = layer[index];
+
+            // Вспышка рождения или смерти.
+            if let Some(flash) = flashes.get(index)
+                && *flash > 0
+            {
+                let strength = (*flash as u32) * FLASH_STRENGTH / FLASH_FRAMES as u32;
+                color = mix(color, 0x00FF_FFFF, strength);
+            }
+
+            let (px, py) = viewport.cell_origin(x, y);
+            canvas.fill_rect(px, py, viewport.cell, viewport.cell, color);
 
             // В режиме геномов внизу клетки показываем состав ДНК:
             // так видно мутацию, которую не показывает цвет.
-            if view == ViewMode::Genome {
-                draw_genome_bar(canvas, snapshot, index, px, py, cell, palette);
+            if spec.decor == Some(Decor::GenomeBar) {
+                draw_genome_bar(canvas, snapshot, index, px, py, viewport.cell, palette);
             }
         }
     }
@@ -1330,7 +2513,7 @@ fn draw_genome_bar(
         return;
     }
 
-    let Some(mix) = snapshot.genome_mix[index] else {
+    let Some(mix) = snapshot.cells[index].genome_mix else {
         return;
     };
 
@@ -1346,49 +2529,13 @@ fn draw_genome_bar(
 
     // Добиваем остаток клетки последним цветом: полоска всегда во всю ширину.
     let rest = (px + cell as i64 - x).max(0) as u32;
-    canvas.fill_rect(x, y, rest, bar_height, palette.action_colors[3]);
-}
-
-/// Цвет клетки в текущем режиме просмотра.
-fn cell_color(snapshot: &JarSnapshot, index: usize, view: ViewMode, palette: &Palette) -> u32 {
-    match view {
-        ViewMode::Minerals => {
-            let max = snapshot.max_minerals.max(1) as u32;
-            let amount = snapshot.minerals[index].min(max as usize) as u32;
-            ramp(amount * 255 / max, &MINERAL_RAMP)
-        }
-        ViewMode::Energy => {
-            if !snapshot.creatures[index] {
-                return palette.jar_bg;
-            }
-            let max = snapshot.max_energy.max(1) as u32;
-            let amount = snapshot.energies[index].min(max as usize) as u32;
-            ramp(amount * 255 / max, &ENERGY_RAMP)
-        }
-        ViewMode::Genome => snapshot.genome_colors[index].unwrap_or(palette.jar_bg),
-        ViewMode::Action => match snapshot.actions[index] {
-            Some(action) => palette.action_colors[action_index(action)],
-            None => palette.jar_bg,
-        },
-        ViewMode::Creatures | ViewMode::Light => {
-            if !snapshot.creatures[index] {
-                return palette.jar_bg;
-            }
-            // Чем больше энергии, тем светлее клетка.
-            let energy = snapshot.energies[index].min(100) as u32;
-            mix(palette.creature, 0x00FF_FFFF, energy * 80 / 100)
-        }
-    }
-}
-
-/// Индекс типа действия в палитре.
-fn action_index(action: CreatureAction) -> usize {
-    match action {
-        CreatureAction::PhotoGrow => 0,
-        CreatureAction::EatMinerals => 1,
-        CreatureAction::Split => 2,
-        CreatureAction::Jump(_) => 3,
-    }
+    canvas.fill_rect(
+        x,
+        y,
+        rest,
+        bar_height,
+        palette.action_colors[ActionKind::COUNT - 1],
+    );
 }
 
 /// Тонкая сетка по границам клеток.
@@ -1421,30 +2568,28 @@ fn draw_grid(
 fn draw_colony_outline(
     canvas: &mut Canvas,
     snapshot: &JarSnapshot,
-    offset_x: i64,
-    offset_y: i64,
-    cell: u32,
+    viewport: &Viewport,
     color: u32,
 ) {
     let size = snapshot.size;
+    let cell = viewport.cell;
 
     for y in 0..size {
         for x in 0..size {
-            if !snapshot.creatures[x + y * size] {
+            if !snapshot.cells[x + y * size].alive {
                 continue;
             }
 
-            let open_above = y == 0 || !snapshot.creatures[x + (y - 1) * size];
-            let open_below = y + 1 == size || !snapshot.creatures[x + (y + 1) * size];
-            let open_left = x == 0 || !snapshot.creatures[(x - 1) + y * size];
-            let open_right = x + 1 == size || !snapshot.creatures[(x + 1) + y * size];
+            let open_above = y == 0 || !snapshot.cells[x + (y - 1) * size].alive;
+            let open_below = y + 1 == size || !snapshot.cells[x + (y + 1) * size].alive;
+            let open_left = x == 0 || !snapshot.cells[(x - 1) + y * size].alive;
+            let open_right = x + 1 == size || !snapshot.cells[(x + 1) + y * size].alive;
 
             if !open_above && !open_below && !open_left && !open_right {
                 continue;
             }
 
-            let px = offset_x + (x as u32 * cell) as i64;
-            let py = offset_y + (y as u32 * cell) as i64;
+            let (px, py) = viewport.cell_origin(x, y);
 
             if open_above {
                 canvas.fill_rect(px, py, cell, 1, color);
@@ -1469,34 +2614,13 @@ fn draw_jar_frame(canvas: &mut Canvas, x: i64, y: i64, grid: u32, palette: &Pale
     canvas.fill_rect(x, y, JAR_SHADOW_THICKNESS, grid, palette.jar_shadow);
 
     // Рамка.
-    canvas.fill_rect(x, y, grid, JAR_FRAME_THICKNESS, palette.jar_frame);
-    canvas.fill_rect(
-        x,
-        y + grid as i64 - JAR_FRAME_THICKNESS as i64,
-        grid,
-        JAR_FRAME_THICKNESS,
-        palette.jar_frame,
-    );
-    canvas.fill_rect(x, y, JAR_FRAME_THICKNESS, grid, palette.jar_frame);
-    canvas.fill_rect(
-        x + grid as i64 - JAR_FRAME_THICKNESS as i64,
-        y,
-        JAR_FRAME_THICKNESS,
-        grid,
-        palette.jar_frame,
-    );
+    canvas.stroke_rect(x, y, grid, grid, JAR_FRAME_THICKNESS, palette.jar_frame);
 }
 
 /// Курсор: четыре уголка, чтобы не перекрывать содержимое клетки.
-fn draw_cursor(
-    canvas: &mut Canvas,
-    context: &RenderContext,
-    offset_x: i64,
-    offset_y: i64,
-    cell: u32,
-) {
+fn draw_cursor(canvas: &mut Canvas, context: &RenderContext, viewport: &Viewport) {
     let (x, y) = context.cursor;
-    let index = x + y * context.snapshot.size;
+    let index = Grid::new(context.snapshot.size).idx(x, y);
     let under = cell_color(context.snapshot, index, context.view, context.palette);
     let palette = context.palette;
     let color = if luma(under) > 140 {
@@ -1505,47 +2629,12 @@ fn draw_cursor(
         palette.cursor_light
     };
 
+    let cell = viewport.cell;
     let arm = (cell / 3).max(3).min(cell);
     let thickness = if cell < 6 { 1 } else { 2 };
-    let px = offset_x + (x as u32 * cell) as i64;
-    let py = offset_y + (y as u32 * cell) as i64;
+    let (px, py) = viewport.cell_origin(x, y);
 
-    // Левый верхний угол.
-    canvas.fill_rect(px, py, arm, thickness, color);
-    canvas.fill_rect(px, py, thickness, arm, color);
-    // Правый верхний.
-    canvas.fill_rect(px + cell as i64 - arm as i64, py, arm, thickness, color);
-    canvas.fill_rect(
-        px + cell as i64 - thickness as i64,
-        py,
-        thickness,
-        arm,
-        color,
-    );
-    // Левый нижний.
-    canvas.fill_rect(
-        px,
-        py + cell as i64 - thickness as i64,
-        arm,
-        thickness,
-        color,
-    );
-    canvas.fill_rect(px, py + cell as i64 - arm as i64, thickness, arm, color);
-    // Правый нижний.
-    canvas.fill_rect(
-        px + cell as i64 - arm as i64,
-        py + cell as i64 - thickness as i64,
-        arm,
-        thickness,
-        color,
-    );
-    canvas.fill_rect(
-        px + cell as i64 - thickness as i64,
-        py + cell as i64 - arm as i64,
-        thickness,
-        arm,
-        color,
-    );
+    canvas.corner_brackets(px, py, cell as i64, arm as i64, thickness as i64, color);
 }
 
 /// Оверлей освещенности.
@@ -1554,42 +2643,47 @@ fn draw_cursor(
 /// поэтому картинка совпадает с областями фотосинтеза и остается гладкой.
 /// Яркость клеток падает в темноте, а на освещенных краях появляется
 /// теплый оттенок солнечного света.
-fn draw_light_overlay(
-    canvas: &mut Canvas,
-    offset_x: i64,
-    offset_y: i64,
-    grid: u32,
-    cell: u32,
-    size: usize,
-) {
+fn draw_light_overlay(canvas: &mut Canvas, viewport: &Viewport) {
+    let size = viewport.size;
+    let cell = viewport.cell;
     let reach_px = light_reach(size) as u32 * cell;
     let table = build_light_table(reach_px, cell, size);
     // Палитра света готовится один раз на кадр, а не на каждый пиксель.
     let palette: Vec<u32> = (0..=255u8).map(light_color).collect();
 
-    let x0 = offset_x.max(0).min(canvas.width as i64) as u32;
-    let y0 = offset_y.max(0).min(canvas.height as i64) as u32;
-    let x1 = (offset_x + grid as i64).max(0).min(canvas.width as i64) as u32;
-    let y1 = (offset_y + grid as i64).max(0).min(canvas.height as i64) as u32;
+    let x0 = viewport.offset_x.max(0).min(canvas.width as i64) as u32;
+    let y0 = viewport.offset_y.max(0).min(canvas.height as i64) as u32;
+    let x1 = (viewport.offset_x + viewport.grid as i64)
+        .max(0)
+        .min(canvas.width as i64) as u32;
+    let y1 = (viewport.offset_y + viewport.grid as i64)
+        .max(0)
+        .min(canvas.height as i64) as u32;
 
-    let right = offset_x + grid as i64 - 1;
-    let bottom = offset_y + grid as i64 - 1;
+    let right = viewport.offset_x + viewport.grid as i64 - 1;
+    let bottom = viewport.offset_y + viewport.grid as i64 - 1;
 
     for py in y0..y1 {
-        let dy = (py as i64 - offset_y).min(bottom - py as i64).max(0);
+        let dy = (py as i64 - viewport.offset_y)
+            .min(bottom - py as i64)
+            .max(0);
 
         for px in x0..x1 {
-            let dx = (px as i64 - offset_x).min(right - px as i64).max(0);
+            let dx = (px as i64 - viewport.offset_x)
+                .min(right - px as i64)
+                .max(0);
             let distance = dx.min(dy) as usize;
             let intensity = table.get(distance).copied().unwrap_or(0);
 
             // В темноте клетки почти не видны, на свету — полная яркость.
             let factor = DARK_FACTOR + mul255(intensity as u32, 255 - DARK_FACTOR);
             let warm = mul255(intensity as u32, WARM_STRENGTH);
-            let index = (py * canvas.width + px) as usize;
-            let lit = scale(canvas.buffer[index], factor);
+            let tint = palette[intensity as usize];
 
-            canvas.buffer[index] = mix(lit, palette[intensity as usize], warm);
+            canvas.shade_pixel(px as i64, py as i64, |current| {
+                let lit = scale(current, factor);
+                mix(lit, tint, warm)
+            });
         }
     }
 }
@@ -1615,50 +2709,46 @@ fn build_light_table(reach_px: u32, cell: u32, size: usize) -> Vec<u8> {
 fn draw_hud(canvas: &mut Canvas, context: &RenderContext) {
     let lines = [context.hud_top.as_str(), context.hud_bottom.as_str()];
     let palette = context.palette;
-    draw_panel(
-        canvas,
-        PANEL_MARGIN as i64,
-        PANEL_MARGIN as i64,
-        &lines,
-        palette,
+    let panel_height = lines.len() as u32 * FONT_HEIGHT + PANEL_PADDING * 2;
+
+    let (x, y) = Anchor::TopLeft.place(
+        (canvas.width, canvas.height),
+        (panel_width_of(&lines), panel_height),
+        PANEL_MARGIN,
     );
+
+    draw_panel(canvas, x, y, &lines, palette);
 }
 
 /// Панель инспектора: что находится в выбранной клетке.
 fn draw_inspector(canvas: &mut Canvas, context: &RenderContext) {
-    let info = &context.info;
-    let mut lines = vec![format!("cell {},{}", info.x, info.y)];
-
-    if info.alive {
-        lines.push(format!("energy {}  minerals {}", info.energy, info.eaten));
-        lines.push(format!(
-            "age {}  action {}",
-            info.age,
-            action_label(info.action)
-        ));
-        lines.push(format!("dna {}", mix_label(info.mix)));
-    } else {
-        lines.push("empty".to_string());
-        lines.push(format!("minerals {}", info.minerals));
-    }
-
+    let lines = inspector_lines(&context.info);
+    let palette = context.palette;
     let panel_height = lines.len() as u32 * FONT_HEIGHT + PANEL_PADDING * 2;
-    let y = canvas.height as i64 - panel_height as i64 - PANEL_MARGIN as i64;
+
     let references: Vec<&str> = lines.iter().map(String::as_str).collect();
-    draw_panel(canvas, PANEL_MARGIN as i64, y, &references, context.palette);
+    let (x, y) = Anchor::BottomLeft.place(
+        (canvas.width, canvas.height),
+        (panel_width_of(&references), panel_height),
+        PANEL_MARGIN,
+    );
+
+    draw_panel(canvas, x, y, &references, palette);
 }
 
 /// Легенда шкалы для режимов-тепкарт.
 fn draw_legend(canvas: &mut Canvas, context: &RenderContext) {
-    let (stops, max_value) = match context.view {
-        ViewMode::Minerals => (&MINERAL_RAMP, context.snapshot.max_minerals),
-        ViewMode::Energy => (&ENERGY_RAMP, context.snapshot.max_energy),
-        _ => return,
+    let Some(legend) = context.view.spec().legend else {
+        return;
     };
+    let (stops, max_value) = legend(context.snapshot);
 
-    let x = canvas.width as i64 - LEGEND_WIDTH as i64 - PANEL_MARGIN as i64;
-    let y =
-        canvas.height as i64 - LEGEND_HEIGHT as i64 - PANEL_MARGIN as i64 - FONT_HEIGHT as i64 - 2;
+    let label_height = FONT_HEIGHT + 2;
+    let (x, y) = Anchor::BottomRight.place(
+        (canvas.width, canvas.height),
+        (LEGEND_WIDTH, LEGEND_HEIGHT + label_height),
+        PANEL_MARGIN,
+    );
 
     for i in 0..LEGEND_WIDTH {
         let t = i * 255 / (LEGEND_WIDTH - 1);
@@ -1675,7 +2765,7 @@ fn draw_legend(canvas: &mut Canvas, context: &RenderContext) {
     );
 
     let max_label = format_count(max_value);
-    let label_x = x + LEGEND_WIDTH as i64 - max_label.len() as i64 * TEXT_ADVANCE as i64;
+    let label_x = x + LEGEND_WIDTH as i64 - max_label.chars().count() as i64 * TEXT_ADVANCE as i64;
     draw_text(
         canvas,
         label_x,
@@ -1686,126 +2776,106 @@ fn draw_legend(canvas: &mut Canvas, context: &RenderContext) {
 }
 
 /// Мини-карта: вся банка целиком и рамка текущего вида.
-fn draw_minimap(
-    canvas: &mut Canvas,
-    context: &RenderContext,
-    offset_x: i64,
-    offset_y: i64,
-    cell: u32,
-) {
+fn draw_minimap(canvas: &mut Canvas, context: &RenderContext, viewport: &Viewport) {
     let snapshot = context.snapshot;
     let size = snapshot.size;
     if size == 0 || MINIMAP_SIZE == 0 {
         return;
     }
 
-    let x = canvas.width as i64 - MINIMAP_SIZE as i64 - PANEL_MARGIN as i64;
-    let y = PANEL_MARGIN as i64;
+    let (x, y) = Anchor::TopRight.place(
+        (canvas.width, canvas.height),
+        (MINIMAP_SIZE, MINIMAP_SIZE),
+        PANEL_MARGIN,
+    );
 
     // Фон мини-карты и точки существ.
     canvas.fill_rect(x, y, MINIMAP_SIZE, MINIMAP_SIZE, context.palette.jar_bg);
 
+    // Мини-карта всегда квадратная: поле размера `size` рисуется в нее
+    // целиком, поэтому карта не вылезает за рамку ни при каком размере поля.
     for cy in 0..size {
         for cx in 0..size {
-            if snapshot.creatures[cx + cy * size] {
-                canvas.fill_rect(x + cx as i64, y + cy as i64, 1, 1, context.palette.creature);
+            if !snapshot.cells[cx + cy * size].alive {
+                continue;
             }
+            let (dx, dy) = minimap_position(cx, cy, size);
+            canvas.fill_rect(x + dx, y + dy, 1, 1, context.palette.creature);
         }
     }
 
     // Рамка текущего вида: какие клетки поля попали в окно.
-    let cell_i = cell.max(1) as i64;
-    let left = ((-offset_x) / cell_i).clamp(0, size as i64);
-    let top = ((-offset_y) / cell_i).clamp(0, size as i64);
-    let right = ((canvas.width as i64 - offset_x) / cell_i).clamp(0, size as i64);
-    let bottom = ((canvas.height as i64 - offset_y) / cell_i).clamp(0, size as i64);
+    let cell_i = viewport.cell.max(1) as i64;
+    let left = ((-viewport.offset_x) / cell_i).clamp(0, size as i64) as usize;
+    let top = ((-viewport.offset_y) / cell_i).clamp(0, size as i64) as usize;
+    let right = ((canvas.width as i64 - viewport.offset_x) / cell_i).clamp(0, size as i64) as usize;
+    let bottom =
+        ((canvas.height as i64 - viewport.offset_y) / cell_i).clamp(0, size as i64) as usize;
 
-    let view_x = x + left;
-    let view_y = y + top;
-    let view_width = (right - left).max(1);
-    let view_height = (bottom - top).max(1);
+    let (view_x, view_y) = minimap_position(left, top, size);
+    let (view_right, view_bottom) = minimap_position(right, bottom, size);
+    let view_width = ((view_right - view_x) as u32).max(1);
+    let view_height = ((view_bottom - view_y) as u32).max(1);
 
-    for edge in 0..view_width {
-        canvas.fill_rect(view_x + edge, view_y, 1, 1, context.palette.cursor_dark);
-        canvas.fill_rect(
-            view_x + edge,
-            view_y + view_height - 1,
-            1,
-            1,
-            context.palette.cursor_dark,
-        );
-    }
-    for edge in 0..view_height {
-        canvas.fill_rect(view_x, view_y + edge, 1, 1, context.palette.cursor_dark);
-        canvas.fill_rect(
-            view_x + view_width - 1,
-            view_y + edge,
-            1,
-            1,
-            context.palette.cursor_dark,
-        );
-    }
+    canvas.stroke_rect(
+        x + view_x,
+        y + view_y,
+        view_width,
+        view_height,
+        1,
+        context.palette.cursor_dark,
+    );
 
     // Внешняя рамка мини-карты.
-    canvas.fill_rect(
+    canvas.stroke_rect(
         x - 1,
         y - 1,
         MINIMAP_SIZE + 2,
-        1,
-        context.palette.panel_border,
-    );
-    canvas.fill_rect(
-        x - 1,
-        y + MINIMAP_SIZE as i64,
         MINIMAP_SIZE + 2,
         1,
-        context.palette.panel_border,
-    );
-    canvas.fill_rect(
-        x - 1,
-        y - 1,
-        1,
-        MINIMAP_SIZE + 2,
-        context.palette.panel_border,
-    );
-    canvas.fill_rect(
-        x + MINIMAP_SIZE as i64,
-        y - 1,
-        1,
-        MINIMAP_SIZE + 2,
         context.palette.panel_border,
     );
 }
 
+/// Положение клетки поля на мини-карте.
+///
+/// Мини-карта всегда квадратная и никогда не больше [`MINIMAP_SIZE`]:
+/// поэтому поле любого размера помещается в нее целиком.
+fn minimap_position(cell_x: usize, cell_y: usize, size: usize) -> (i64, i64) {
+    let map = MINIMAP_SIZE as usize;
+    ((cell_x * map / size) as i64, (cell_y * map / size) as i64)
+}
+
+/// Ширина текста панели в пикселях.
+///
+/// Считается по символам, а не по байтам: кириллица в UTF-8
+/// занимает два байта, но рисуется одним глифом.
+fn panel_text_width<'a, I: Iterator<Item = &'a str>>(lines: I) -> u32 {
+    lines
+        .map(|line| line.chars().count() as u32 * TEXT_ADVANCE)
+        .max()
+        .unwrap_or(0)
+}
+
+/// Ширина панели в пикселях.
+fn panel_width<'a, I: Iterator<Item = &'a str>>(lines: I) -> u32 {
+    panel_text_width(lines) + PANEL_PADDING * 2
+}
+
+/// Ширина панели по готовому срезу строк.
+fn panel_width_of(lines: &[&str]) -> u32 {
+    panel_width(lines.iter().copied())
+}
+
 /// Панель с текстом на светлом фоне.
 fn draw_panel(canvas: &mut Canvas, x: i64, y: i64, lines: &[&str], palette: &Palette) {
-    let text_width = lines
-        .iter()
-        .map(|line| line.len() as u32 * TEXT_ADVANCE)
-        .max()
-        .unwrap_or(0);
-    let panel_width = text_width + PANEL_PADDING * 2;
+    let panel_width = panel_width_of(lines);
     let panel_height = lines.len() as u32 * FONT_HEIGHT + PANEL_PADDING * 2;
 
     canvas.fill_rect(x, y, panel_width, panel_height, palette.panel_bg);
 
     // Рамка панели.
-    canvas.fill_rect(x, y, panel_width, 1, palette.panel_border);
-    canvas.fill_rect(
-        x,
-        y + panel_height as i64 - 1,
-        panel_width,
-        1,
-        palette.panel_border,
-    );
-    canvas.fill_rect(x, y, 1, panel_height, palette.panel_border);
-    canvas.fill_rect(
-        x + panel_width as i64 - 1,
-        y,
-        1,
-        panel_height,
-        palette.panel_border,
-    );
+    canvas.stroke_rect(x, y, panel_width, panel_height, 1, palette.panel_border);
 
     for (index, line) in lines.iter().enumerate() {
         draw_text(
@@ -1842,25 +2912,21 @@ fn draw_text(canvas: &mut Canvas, x: i64, y: i64, text: &str, color: u32) {
 /// Подпись типа действия.
 fn action_label(action: Option<CreatureAction>) -> &'static str {
     match action {
-        Some(CreatureAction::PhotoGrow) => "photo",
-        Some(CreatureAction::EatMinerals) => "eat",
-        Some(CreatureAction::Split) => "split",
-        Some(CreatureAction::Jump(_)) => "jump",
+        Some(action) => action.kind().label(),
         None => "-",
     }
 }
 
 /// Подпись состава генома: доли типов генов в процентах.
-fn mix_label(mix: Option<[u8; 4]>) -> String {
+fn mix_label(mix: Option<[u8; ActionKind::COUNT]>) -> String {
     let Some(mix) = mix else {
         return "-".to_string();
     };
 
-    let names = ["photo", "eat", "split", "jump"];
-    let parts: Vec<String> = names
+    let parts: Vec<String> = ActionKind::ALL
         .iter()
         .enumerate()
-        .map(|(index, name)| format!("{name} {}%", mix[index] as u32 * 100 / 255))
+        .map(|(index, kind)| format!("{} {}%", kind.label(), mix[index] as u32 * 100 / 255))
         .collect();
 
     parts.join(" ")
@@ -1871,14 +2937,20 @@ fn format_count(value: usize) -> String {
     if value >= 1_000_000 {
         format!("{:.1}m", value as f32 / 1_000_000.0)
     } else if value >= 10_000 {
-        format!("{:.1}k", value as f32 / 1_000.0)
+        let thousands = value as f32 / 1_000.0;
+        // 999999 должен показываться как 1.0m, а не как 1000.0k.
+        if thousands >= 999.95 {
+            format!("{:.1}m", thousands / 1_000.0)
+        } else {
+            format!("{:.1}k", thousands)
+        }
     } else {
         value.to_string()
     }
 }
 
 /// Цвет по рампе: `t` в диапазоне 0..=255.
-fn ramp(t: u32, stops: &[(u32, (u32, u32, u32)); 5]) -> u32 {
+fn ramp(t: u32, stops: &[Stop]) -> u32 {
     let t = t.min(255);
 
     for pair in stops.windows(2) {
@@ -1941,547 +3013,2404 @@ fn mul255(value: u32, factor: u32) -> u32 {
 /// Красивый градиент освещенности: от почти черной тьмы в центре
 /// через синий и теплый оранжевый к мягкому солнечному свету у края.
 fn light_color(intensity: u8) -> u32 {
-    const STOPS: [(u32, (u32, u32, u32)); 4] = [
-        (0, (8, 10, 24)),
-        (90, (36, 50, 112)),
-        (180, (212, 116, 52)),
-        (255, (255, 244, 190)),
-    ];
+    ramp(intensity as u32, &LIGHT_RAMP)
+}
 
-    let value = intensity as u32;
-    for pair in STOPS.windows(2) {
-        let (from_value, from_color) = pair[0];
-        let (to_value, to_color) = pair[1];
+// ===========================================================================
+// Приложение
+// ===========================================================================
 
-        if value <= to_value {
-            let t = (value - from_value) * 255 / (to_value - from_value);
-            let mix = |from: u32, to: u32| ((from * (255 - t) + to * t) / 255) as u8;
-            return rgb(
-                mix(from_color.0, to_color.0),
-                mix(from_color.1, to_color.1),
-                mix(from_color.2, to_color.2),
-            );
+fn main() {
+    let jar = seeded_jar();
+
+    let event_loop = match EventLoop::new() {
+        Ok(event_loop) => event_loop,
+        Err(err) => {
+            eprintln!("Не удалось создать event loop: {err}");
+            return;
         }
-    }
-
-    rgb(255, 244, 190)
-}
-
-fn rgb(r: u8, g: u8, b: u8) -> u32 {
-    ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
-}
-
-/// Расстояние от клетки до ближайшего края Jar.
-fn distance_to_edge(x: usize, y: usize, size: usize) -> usize {
-    let last = size.saturating_sub(1);
-    x.min(y)
-        .min(last.saturating_sub(x))
-        .min(last.saturating_sub(y))
-}
-
-/// Половина расстояния от края до центра — дальше света нет.
-fn light_reach(size: usize) -> usize {
-    (size / 4).max(1)
-}
-
-/// Сколько энергии дает фотосинтез в клетке `(x, y)`.
-///
-/// Свет идет от краев Jar к центру и полностью затухает на половине пути
-/// к центру. Чем ближе клетка к краю, тем больше энергии она получает.
-fn light_level(x: usize, y: usize, size: usize) -> usize {
-    let reach = light_reach(size);
-    let distance = distance_to_edge(x, y, size);
-
-    if distance >= reach {
-        return 0;
-    }
-
-    MAX_PHOTOSYNTHESIS_ENERGY - MAX_PHOTOSYNTHESIS_ENERGY * distance / reach
-}
-
-/// Прибавляет `delta` к указателю ДНК, не позволяя ему стать отрицательным.
-fn apply_jump(pointer: usize, delta: isize) -> usize {
-    let next = pointer as isize + delta;
-    if next < 0 { 0 } else { next as usize }
-}
-
-/// Оттенок гена в градусах HSV.
-fn gene_hue(action: &CreatureAction) -> f32 {
-    match action {
-        CreatureAction::PhotoGrow => 120.0,
-        CreatureAction::EatMinerals => 240.0,
-        CreatureAction::Split => 0.0,
-        CreatureAction::Jump(_) => 300.0,
-    }
-}
-
-/// Цвет генома: взвешенная циркулярная средняя оттенков генов.
-///
-/// Насыщенность всегда 100%, поэтому смесь любых генов остается яркой
-/// и никогда не превращается в серый цвет.
-pub(crate) fn genome_color(genome: &CreatureGenome) -> u32 {
-    let mut sin_sum = 0.0f32;
-    let mut cos_sum = 0.0f32;
-
-    for (i, action) in genome.line.iter().enumerate() {
-        let weight = (i + 1) as f32;
-        let radians = gene_hue(action).to_radians();
-        sin_sum += weight * radians.sin();
-        cos_sum += weight * radians.cos();
-    }
-
-    // Если противоположные оттенки почти погасили друг друга,
-    // берем оттенок первого гена. Насыщенность все равно останется 100%.
-    let hue = if sin_sum * sin_sum + cos_sum * cos_sum < 1e-6 {
-        gene_hue(&genome.line[0])
-    } else {
-        sin_sum.atan2(cos_sum).to_degrees().rem_euclid(360.0)
     };
+    event_loop.set_control_flow(ControlFlow::Wait);
 
-    hsv_to_rgb(hue, 1.0, 0.85)
+    let mut app = App::new(jar);
+    if let Err(err) = event_loop.run_app(&mut app) {
+        eprintln!("Ошибка event loop: {err}");
+    }
 }
 
-/// Переводит HSV в packed RGB.
-fn hsv_to_rgb(hue: f32, saturation: f32, value: f32) -> u32 {
-    let h = hue.rem_euclid(360.0) / 60.0;
-    let c = value * saturation;
-    let x = c * (1.0 - (h % 2.0 - 1.0).abs());
-    let (r, g, b) = match h as u32 {
-        0 => (c, x, 0.0),
-        1 => (x, c, 0.0),
-        2 => (0.0, c, x),
-        3 => (0.0, x, c),
-        4 => (x, 0.0, c),
-        _ => (c, 0.0, x),
-    };
-    let m = value - c;
+/// Окно вместе с поверхностью для рисования.
+type WindowStack = (
+    Arc<Window>,
+    Context<Arc<Window>>,
+    Surface<Arc<Window>, Arc<Window>>,
+);
 
-    rgb(
-        ((r + m) * 255.0).round() as u8,
-        ((g + m) * 255.0).round() as u8,
-        ((b + m) * 255.0).round() as u8,
-    )
+/// Создает окно вместе с поверхностью для рисования.
+///
+/// Все три шага могут провалиться, поэтому ошибка собирается в одно
+/// сообщение: вызывающий код только печатает его и выходит.
+fn create_window_stack(event_loop: &ActiveEventLoop) -> Result<WindowStack, String> {
+    let attributes = Window::default_attributes()
+        .with_title("Cells")
+        .with_inner_size(LogicalSize::new(800.0, 800.0))
+        .with_min_inner_size(LogicalSize::new(320.0, 320.0));
+
+    let window = event_loop
+        .create_window(attributes)
+        .map(Arc::new)
+        .map_err(|err| format!("Не удалось создать окно: {err}"))?;
+
+    let context = Context::new(window.clone())
+        .map_err(|err| format!("Не удалось создать softbuffer context: {err}"))?;
+
+    let surface = Surface::new(&context, window.clone())
+        .map_err(|err| format!("Не удалось создать softbuffer surface: {err}"))?;
+
+    Ok((window, context, surface))
 }
 
-pub struct Jar {
-    /// Ширина и высота пространства
-    pub size: usize,
+/// Приложение winit: хранит Jar, раз в кадр обновляет снапшот и рисует его.
+struct App {
+    jar: Jar,
+    snapshot: JarSnapshot,
 
-    /// Номер тика, используется для рандома
-    pub tick: usize,
+    window: Option<Arc<Window>>,
+    context: Option<Context<Arc<Window>>>,
+    surface: Option<Surface<Arc<Window>, Arc<Window>>>,
 
-    /// Слой существ
-    pub creatures: Vec<Option<Creature>>,
-    /// Слой минералов
-    pub minerals: Vec<usize>,
-    /// Генератор случайности для мутаций и выбора направления деления.
-    pub rng: Rng,
+    /// Палитра отрисовки.
+    palette: Palette,
+    /// Камера: размер клетки, окно и положение выделения.
+    camera: Camera,
+    /// Автоповтор перемещения выделения.
+    keys: KeyRepeat,
+    /// Часы симуляции: скорость, пауза и расписание тиков.
+    clock: SimClock,
+    /// Режим просмотра поля.
+    view_mode: ViewMode,
+    /// Вспышки рождения и смерти: сколько кадров осталось каждой клетке.
+    flashes: Vec<u8>,
+    /// Цвета клеток прошлого кадра: для сглаживания шкалы в тепкартах.
+    cell_layer: Vec<u32>,
+    /// Маска существ в прошлом кадре: по ней считаются вспышки.
+    prev_creatures: Vec<bool>,
+    /// Когда последний раз обновлялся заголовок окна.
+    last_title: Instant,
+    /// Заголовок окна, который уже выведен: обновляем только при изменении.
+    title: String,
 }
-impl Jar {
-    /// Jar квадратная
-    pub fn new(size: usize) -> Self {
-        let creatures = vec![None; size * size];
-        let minerals = vec![100usize; size * size];
+
+impl App {
+    fn new(jar: Jar) -> Self {
+        let mut snapshot = JarSnapshot::new(jar.size);
+        jar.snapshot_into(&mut snapshot);
+
+        let size = jar.size;
+        let palette = Palette::new();
+        let now = Instant::now();
 
         Self {
-            size,
-            tick: 0,
-            creatures,
-            minerals,
-            rng: Rng::from_time(),
+            flashes: vec![0; size * size],
+            cell_layer: vec![palette.jar_bg; size * size],
+            prev_creatures: snapshot.cells.iter().map(|cell| cell.alive).collect(),
+            snapshot,
+            jar,
+            window: None,
+            context: None,
+            surface: None,
+            palette,
+            // Стартовая камера смотрит на верхнюю колонию: в центре банки никого нет.
+            camera: Camera::new(size, (800, 800)),
+            keys: KeyRepeat::new(now),
+            clock: SimClock::new(now),
+            view_mode: ViewMode::Creatures,
+            last_title: now - TITLE_INTERVAL,
+            title: String::new(),
         }
     }
 
-    /// Создает снимок состояния мира для отрисовки.
-    pub fn snapshot(&self) -> JarSnapshot {
-        let mut max_minerals = 0;
-        let mut max_energy = 0;
-        let mut population = 0;
-
-        for (index, cell) in self.creatures.iter().enumerate() {
-            max_minerals = max_minerals.max(self.minerals[index]);
-            if let Some(creature) = cell {
-                max_energy = max_energy.max(creature.energy);
-                population += 1;
-            }
-        }
-
-        JarSnapshot {
-            size: self.size,
-            tick: self.tick,
-            minerals: self.minerals.clone(),
-            creatures: self.creatures.iter().map(|cell| cell.is_some()).collect(),
-            energies: self
-                .creatures
-                .iter()
-                .map(|cell| cell.as_ref().map_or(0, |creature| creature.energy))
-                .collect(),
-            genome_colors: self
-                .creatures
-                .iter()
-                .map(|cell| cell.as_ref().map(|creature| genome_color(&creature.genome)))
-                .collect(),
-            actions: self
-                .creatures
-                .iter()
-                .map(|cell| cell.as_ref().and_then(|creature| creature.last_action))
-                .collect(),
-            genome_mix: self
-                .creatures
-                .iter()
-                .map(|cell| cell.as_ref().map(|creature| genome_mix(&creature.genome)))
-                .collect(),
-            max_minerals,
-            max_energy,
-            population,
+    fn request_redraw(&self) {
+        if let Some(window) = &self.window {
+            window.request_redraw();
         }
     }
 
-    pub fn simulation_step(&mut self) {
-        self.tick += 1;
-        for i in 0..(self.size * self.size) {
-            if let Some(mut creature) = self.creatures[i].clone() {
-                // Если в клетке есть существо, берем его копию
-                creature.age += 1;
-
-                if creature.age >= CREATURE_LIFETIME_TICKS {
-                    // Клетка прожила свой срок - умирает, а все ее минералы
-                    // возвращаются обратно на карту
-                    self.minerals[i] += creature.minerals;
-                    self.creatures[i] = None;
-                    continue;
-                }
-
-                let action = creature.genome.get_action();
-                // Запоминаем, что именно сделала клетка: по этому видно цикл ДНК.
-                creature.last_action = Some(action);
-
-                match action {
-                    CreatureAction::Split => {
-                        // Для деления нужно минимум 100 энергии и минимум 10 минералов
-                        if creature.energy >= 100 && creature.minerals >= 10 {
-                            let i_x = i % self.size;
-                            let i_y = i / self.size;
-
-                            // Проверить рядомстоящие позиции. Если рядом свободно - добавить эту  позицию в массив
-                            let nears: Vec<usize> = [(1isize, 0isize), (-1, 0), (0, 1), (0, -1)]
-                                .iter()
-                                .filter_map(|&(dx, dy)| {
-                                    let x = i_x.checked_add_signed(dx)?;
-                                    let y = i_y.checked_add_signed(dy)?;
-                                    if x >= self.size || y >= self.size {
-                                        return None; // Вышли за границы поля
-                                    }
-                                    let j = x + y * self.size;
-                                    if self.creatures[j].is_none() {
-                                        Some(j)
-                                    } else {
-                                        None
-                                    }
-                                })
-                                .collect();
-
-                            if nears.is_empty() {
-                                // Некуда делиться - клетка умирает, а все ее минералы
-                                // возвращаются обратно на карту
-                                self.minerals[i] += creature.minerals;
-                                self.creatures[i] = None;
-                            } else {
-                                // Есть куда положить дочернюю клетку
-                                let (new_0, new_1) = creature.split(&mut self.rng);
-                                let j = nears[self.tick % nears.len()]; // Выбор места дочерней клетки
-                                self.creatures[i] = Some(new_0); // На месте материнской клетки
-                                self.creatures[j] = Some(new_1);
-                            }
-                        } else {
-                            self.creatures[i] = Some(creature);
-                        }
-                    }
-                    CreatureAction::PhotoGrow => {
-                        let x = i % self.size;
-                        let y = i / self.size;
-                        creature.energy += light_level(x, y, self.size);
-                        self.creatures[i] = Some(creature);
-                    }
-                    CreatureAction::EatMinerals => {
-                        // Есть можно, только если хватает энергии и минералов.
-                        if self.minerals[i] > 0 && creature.energy >= EAT_MINERALS_ENERGY_COST {
-                            creature.energy -= EAT_MINERALS_ENERGY_COST;
-                            creature.minerals += 1;
-                            self.minerals[i] -= 1;
-                        }
-                        self.creatures[i] = Some(creature);
-                    }
-                    CreatureAction::Jump(delta) => {
-                        // get_action уже сдвинул указатель на +1, поэтому здесь
-                        // получается итоговый сдвиг +1+X.
-                        creature.genome.line_pointer =
-                            apply_jump(creature.genome.line_pointer, delta);
-                        self.creatures[i] = Some(creature);
-                    }
-                }
-            }
-        }
+    /// Текст заголовка окна.
+    fn title_text(&self) -> String {
+        let pause = if self.clock.paused { " | paused" } else { "" };
+        format!(
+            "Cells | tick {} | pop {} | zoom {} | speed {} | mode {}{}",
+            self.snapshot.tick,
+            self.snapshot.population,
+            self.zoom_label(),
+            self.clock.speed_label(),
+            self.view_mode.label(),
+            pause
+        )
     }
 
-    pub fn print(&self) {
-        for y in 0..self.size {
-            for x in 0..self.size {
-                if self.creatures[x + y * self.size].is_none() {
-                    print!("·");
-                } else {
-                    print!("█");
-                }
-            }
-            println!();
+    /// Масштаб относительно вписанного вида.
+    fn zoom_label(&self) -> String {
+        if !self.camera.selection_active() {
+            return "fit".to_string();
         }
+
+        let fit = self.camera.fit_cell_size.max(1) as f32;
+        format!("x{:.1}", self.camera.cell_size as f32 / fit)
     }
-}
-#[derive(Clone, Debug)]
-pub struct Creature {
-    /// Пока что введем абстракцию, что ген 0 - это фотосинтезировать, а при достижении энергии 100 клетка делится в случайную сторону
-    pub genome: CreatureGenome,
 
-    pub energy: usize,
-    pub minerals: usize,
-    /// Возраст клетки в тиках.
-    pub age: usize,
-    /// Последнее выполненное действие: нужно для режима просмотра `action`.
-    pub last_action: Option<CreatureAction>,
-}
-impl Creature {
-    /// Делит клетку на две.
-    ///
-    /// Каждая дочерняя клетка получает по 40% изначальной энергии, остаток теряется
-    /// на само деление. Минералы делятся поровну без потерь: неделимый остаток
-    /// достается материнской клетке. Обе дочерние клетки рождаются с нулевым возрастом.
-    ///
-    /// Каждая дочерняя клетка независимо может получить мутацию генома.
-    pub fn split(&self, rng: &mut Rng) -> (Self, Self) {
-        let energy = self.energy;
-        let minerals = self.minerals;
-
-        let e_0 = energy * 40 / 100;
-        let e_1 = energy * 40 / 100;
-
-        let m_0 = (minerals / 2) + (minerals % 2);
-        let m_1 = minerals - m_0;
-
-        let mut c_0 = Creature {
-            genome: self.genome.clone(),
-            energy: e_0,
-            minerals: m_0,
-            age: 0,
-            last_action: None,
-        };
-        let mut c_1 = Creature {
-            genome: self.genome.clone(),
-            energy: e_1,
-            minerals: m_1,
-            age: 0,
-            last_action: None,
+    /// Обновляет заголовок окна, но не чаще чем раз в `TITLE_INTERVAL`.
+    fn update_title(&mut self) {
+        let Some(window) = self.window.clone() else {
+            return;
         };
 
-        c_0.genome.line_pointer = 0;
-        c_1.genome.line_pointer = 0;
-
-        if rng.chance_percent(MUTATION_CHANCE_PERCENT) {
-            c_0.genome.mutate(rng);
-        }
-        if rng.chance_percent(MUTATION_CHANCE_PERCENT) {
-            c_1.genome.mutate(rng);
-        }
-
-        (c_0, c_1)
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CreatureAction {
-    Split,
-    PhotoGrow,
-    EatMinerals,
-    /// Сдвинуть указатель ДНК на X (вдобавок к обычному +1).
-    Jump(isize),
-}
-#[derive(Clone, Debug)]
-pub struct CreatureGenome {
-    /// Нить "ДНК"
-    pub line: Vec<CreatureAction>,
-    pub line_pointer: usize,
-}
-impl CreatureGenome {
-    /// Стандартный геном из 16 генов.
-    ///
-    /// Базовый паттерн `[PhotoGrow, PhotoGrow, EatMinerals, Split]`
-    /// повторяется четыре раза.
-    pub fn standard() -> Self {
-        let pattern = [
-            CreatureAction::PhotoGrow,
-            CreatureAction::PhotoGrow,
-            CreatureAction::EatMinerals,
-            CreatureAction::Split,
-        ];
-
-        Self {
-            line: pattern.iter().cycle().take(16).copied().collect(),
-            line_pointer: 0,
-        }
-    }
-
-    /// Создает геном из готовой нити ДНК.
-    pub fn from_line(line: Vec<CreatureAction>) -> Self {
-        Self {
-            line,
-            line_pointer: 0,
-        }
-    }
-
-    /// Мутирует геном одним случайным способом:
-    /// вставка гена, удаление гена, замена гена или изменение значения Jump.
-    pub fn mutate(&mut self, rng: &mut Rng) {
-        if self.line.is_empty() {
-            self.line.push(random_action(rng));
+        let now = Instant::now();
+        if now.duration_since(self.last_title) < TITLE_INTERVAL {
             return;
         }
 
-        match rng.below(4) {
-            0 => {
-                // Вставка нового гена в случайную позицию.
-                let index = rng.below(self.line.len() + 1);
-                self.line.insert(index, random_action(rng));
+        let text = self.title_text();
+        if text == self.title {
+            return;
+        }
+
+        self.last_title = now;
+        self.title = text.clone();
+        window.set_title(&text);
+    }
+
+    /// Выполняет команду.
+    fn apply(&mut self, command: Command) {
+        match command {
+            Command::TogglePause => self.toggle_pause(),
+            Command::NextView => self.toggle_view_mode(),
+            Command::FitZoom => self.fit_zoom(),
+            Command::SpeedUp => self.change_speed(1),
+            Command::SpeedDown => self.change_speed(-1),
+            Command::Zoom(steps) => self.zoom(steps),
+            Command::Move(direction) => {
+                self.camera.move_selection(direction);
+                self.request_redraw();
             }
-            1 => {
-                // Изменение значения Jump; если Jump нет — обычная замена гена.
-                if !self.mutate_jump_value(rng) {
-                    self.replace_gene(rng);
+        }
+    }
+
+    /// Меняет скорость симуляции: delta > 0 — быстрее, delta < 0 — медленнее.
+    fn change_speed(&mut self, delta: i32) {
+        let new_speed = if delta > 0 {
+            self.clock.speed.faster()
+        } else if delta < 0 {
+            self.clock.speed.slower()
+        } else {
+            self.clock.speed
+        };
+
+        if new_speed != self.clock.speed {
+            self.clock.set_speed(new_speed);
+            self.update_title();
+        }
+    }
+
+    /// Ставит симуляцию на паузу или снимает ее.
+    fn toggle_pause(&mut self) {
+        self.clock.toggle_pause(Instant::now());
+        self.update_title();
+    }
+
+    /// Переключает режим просмотра поля.
+    fn toggle_view_mode(&mut self) {
+        self.view_mode = self.view_mode.next();
+        self.update_title();
+        self.request_redraw();
+    }
+
+    fn zoom(&mut self, steps: i32) {
+        self.camera.zoom(steps);
+        self.update_title();
+        self.request_redraw();
+    }
+
+    /// Вписывает поле в окно целиком.
+    fn fit_zoom(&mut self) {
+        self.camera.fit_zoom();
+        self.update_title();
+        self.request_redraw();
+    }
+
+    /// Клавиша движения нажата: первый сдвиг и запуск автоповтора.
+    fn press_direction(&mut self, direction: Direction) {
+        let now = Instant::now();
+        self.keys.press(direction, now);
+        self.apply(Command::Move(direction));
+    }
+
+    /// Клавиша движения отпущена: автоповтор по ней прекращается.
+    fn release_direction(&mut self, direction: Direction) {
+        self.keys.release(direction, Instant::now());
+    }
+
+    /// Пересчитывает вспышки рождения и смерти по разнице двух кадров.
+    fn update_flashes(&mut self) {
+        for (index, cell) in self.snapshot.cells.iter().enumerate() {
+            let was_alive = self.prev_creatures[index];
+            if cell.alive != was_alive {
+                self.flashes[index] = FLASH_FRAMES;
+            } else if self.flashes[index] > 0 {
+                self.flashes[index] -= 1;
+            }
+        }
+
+        for (index, cell) in self.snapshot.cells.iter().enumerate() {
+            self.prev_creatures[index] = cell.alive;
+        }
+    }
+
+    /// Данные выбранной клетки для инспектора.
+    fn cell_info(&self) -> CellInfo {
+        let (x, y) = (self.camera.cursor_x, self.camera.cursor_y);
+        CellInfo::from_snapshot(&self.snapshot, x, y)
+    }
+
+    /// Обновляет снимок мира и вспышки после тиков симуляции.
+    fn refresh_snapshot(&mut self) {
+        self.jar.snapshot_into(&mut self.snapshot);
+        self.update_flashes();
+    }
+
+    fn render(&mut self) {
+        let Some(window) = self.window.clone() else {
+            return;
+        };
+
+        let size = window.inner_size();
+        let (Some(width), Some(height)) =
+            (NonZeroU32::new(size.width), NonZeroU32::new(size.height))
+        else {
+            return;
+        };
+
+        // Всё, что читает состояние мира, считаем до того, как взяли поверхность.
+        let selection_active = self.camera.selection_active();
+        let info = self.cell_info();
+        let [hud_top, hud_bottom] = hud_lines(
+            &self.snapshot,
+            self.view_mode,
+            &self.clock.speed_label(),
+            &self.zoom_label(),
+            self.clock.paused,
+        );
+
+        {
+            let Some(surface) = self.surface.as_mut() else {
+                return;
+            };
+
+            if let Err(err) = surface.resize(width, height) {
+                eprintln!("Не удалось изменить размер поверхности: {err}");
+                return;
+            }
+
+            let Ok(mut buffer) = surface.buffer_mut() else {
+                return;
+            };
+
+            let mut context = RenderContext {
+                snapshot: &self.snapshot,
+                view: self.view_mode,
+                palette: &self.palette,
+                cell_size: self.camera.cell_size,
+                flashes: &self.flashes,
+                cell_layer: &mut self.cell_layer,
+                selection_active,
+                cursor: (self.camera.cursor_x, self.camera.cursor_y),
+                info,
+                hud_top,
+                hud_bottom,
+            };
+
+            let mut canvas = Canvas {
+                buffer: &mut buffer,
+                width: width.get(),
+                height: height.get(),
+            };
+            draw_snapshot(&mut canvas, &mut context);
+
+            if let Err(err) = buffer.present() {
+                eprintln!("Не удалось показать кадр: {err}");
+            }
+        }
+
+        self.update_title();
+    }
+}
+
+impl ApplicationHandler for App {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if self.window.is_some() {
+            return;
+        }
+
+        let stack = match create_window_stack(event_loop) {
+            Ok(stack) => stack,
+            Err(err) => {
+                eprintln!("{err}");
+                event_loop.exit();
+                return;
+            }
+        };
+
+        let size = stack.0.inner_size();
+        self.camera.set_window_size(size.width, size.height);
+        self.camera.fit_zoom();
+
+        self.window = Some(stack.0);
+        self.context = Some(stack.1);
+        self.surface = Some(stack.2);
+
+        self.request_redraw();
+    }
+
+    fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
+        self.surface = None;
+        self.context = None;
+        self.window = None;
+        // Клавиша отпускания может не прийти: останавливаем автоповтор.
+        self.keys.release_all();
+    }
+
+    fn window_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        _window_id: WindowId,
+        event: WindowEvent,
+    ) {
+        match event {
+            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::Resized(size) => {
+                self.camera.set_window_size(size.width, size.height);
+                self.request_redraw();
+            }
+            WindowEvent::RedrawRequested => self.render(),
+            WindowEvent::Focused(false) => {
+                // При потере фокуса окно не пришлет отпускание клавиши.
+                self.keys.release_all();
+            }
+            WindowEvent::KeyboardInput { event, .. } => {
+                // Клавиши перемещения работают в обоих состояниях:
+                // нажатие двигает выделение, отпускание останавливает автоповтор.
+                if let Some(direction) = Direction::from_key(event.physical_key) {
+                    match event.state {
+                        ElementState::Pressed => {
+                            // Системный автоповтор игнорируем: свой считаем сами,
+                            // иначе выделение сдвигалось бы на две клетки.
+                            if !event.repeat {
+                                self.press_direction(direction);
+                            }
+                        }
+                        ElementState::Released => self.release_direction(direction),
+                    }
+                    return;
+                }
+
+                if event.state == ElementState::Pressed
+                    && let Some(command) = command_from_key(event.physical_key)
+                {
+                    self.apply(command);
                 }
             }
-            2 => {
-                // Удаление гена, но геном никогда не остается пустым.
-                if self.line.len() > 1 {
-                    let index = rng.below(self.line.len());
-                    self.line.remove(index);
-                } else {
-                    self.replace_gene(rng);
+            WindowEvent::MouseWheel { delta, .. } => {
+                let scroll = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => y,
+                    MouseScrollDelta::PixelDelta(position) => position.y as f32 / 50.0,
+                };
+
+                if scroll > 0.0 {
+                    self.apply(Command::Zoom(1));
+                } else if scroll < 0.0 {
+                    self.apply(Command::Zoom(-1));
                 }
             }
-            _ => self.replace_gene(rng),
+            _ => {}
         }
     }
 
-    /// Заменяет случайный ген на случайный другой.
-    fn replace_gene(&mut self, rng: &mut Rng) {
-        let index = rng.below(self.line.len());
-        self.line[index] = random_action(rng);
-    }
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let now = Instant::now();
 
-    /// Изменяет значение случайного гена Jump. Возвращает `false`, если Jump нет.
-    fn mutate_jump_value(&mut self, rng: &mut Rng) -> bool {
-        let jump_positions: Vec<usize> = self
-            .line
-            .iter()
-            .enumerate()
-            .filter_map(|(index, action)| {
-                matches!(action, CreatureAction::Jump(_)).then_some(index)
-            })
-            .collect();
-
-        if jump_positions.is_empty() {
-            return false;
+        // Автоповтор перемещения работает и на паузе.
+        if let Some(direction) = self.keys.poll(now) {
+            self.camera.move_selection(direction);
+            self.request_redraw();
         }
 
-        let index = jump_positions[rng.below(jump_positions.len())];
-        if let CreatureAction::Jump(value) = &mut self.line[index] {
-            *value += random_jump_delta(rng);
+        if self.clock.paused {
+            // На паузе спим, но если клавиша удерживается, просыпаемся ради неё.
+            if self.keys.is_held() {
+                let next_repeat = self.keys.next_repeat_at().unwrap_or(now + REPEAT_DELAY);
+                event_loop.set_control_flow(ControlFlow::WaitUntil(next_repeat));
+            } else {
+                event_loop.set_control_flow(ControlFlow::Wait);
+            }
+            return;
         }
 
-        true
-    }
+        let ticks = self.clock.ticks_due(now);
+        if ticks > 0 {
+            self.run_ticks(ticks);
+            self.refresh_snapshot();
+            self.request_redraw();
+        }
 
-    /// Выдает текущее действие клетки, сдвигает указатель действия на следующий
-    pub fn get_action(&mut self) -> CreatureAction {
-        let now_pointer = self.line_pointer % self.line.len();
-        self.line_pointer += 1;
-        self.line[now_pointer]
+        // Просыпаемся на кадр симуляции или на момент автоповтора — что раньше.
+        let mut wake = self.clock.next_frame;
+        if let Some(next_repeat) = self.keys.next_repeat_at()
+            && next_repeat < wake
+        {
+            wake = next_repeat;
+        }
+        event_loop.set_control_flow(ControlFlow::WaitUntil(wake));
     }
 }
 
-pub struct JarSnapshot {
-    /// Ширина и высота снимка
-    pub size: usize,
-    /// Номер тика, к которому относится снимок
-    pub tick: usize,
-    pub minerals: Vec<usize>,
-    pub creatures: Vec<bool>,
-    /// Энергия существ, 0 для пустых клеток.
-    pub energies: Vec<usize>,
-    /// Цвет генома существа, `None` для пустых клеток.
-    pub genome_colors: Vec<Option<u32>>,
-    /// Последнее выполненное действие клетки, `None` для пустых клеток.
-    pub actions: Vec<Option<CreatureAction>>,
-    /// Доли генов каждого типа в геноме, `None` для пустых клеток.
-    pub genome_mix: Vec<Option<[u8; 4]>>,
-    /// Максимум минералов в поле: верхняя граница шкалы.
-    pub max_minerals: usize,
-    /// Максимум энергии в поле: верхняя граница шкалы.
-    pub max_energy: usize,
-    /// Сколько существ в поле.
-    pub population: usize,
+impl App {
+    /// Выполняет тики симуляции, но не дольше бюджета времени на кадр.
+    ///
+    /// Бюджет спасает окно от зависания на большой скорости.
+    fn run_ticks(&mut self, ticks: u32) {
+        let deadline = Instant::now() + TICK_BUDGET;
+
+        for _ in 0..ticks {
+            self.jar.simulation_step();
+            if Instant::now() >= deadline {
+                break;
+            }
+        }
+    }
 }
 
-/// Доли генов каждого типа в геноме: [PhotoGrow, EatMinerals, Split, Jump].
-///
-/// Сумма долей всегда равна 255, поэтому полоска состава генома
-/// заполняет клетку целиком.
-fn genome_mix(genome: &CreatureGenome) -> [u8; 4] {
-    let mut counts = [0u32; 4];
-    for action in &genome.line {
-        counts[action_index(*action)] += 1;
-    }
-
-    let total: u32 = counts.iter().sum();
-    if total == 0 {
-        return [255, 0, 0, 0];
-    }
-
-    let mut mix = [0u8; 4];
-    let mut sum = 0u32;
-    for index in 0..3 {
-        mix[index] = (counts[index] * 255 / total) as u8;
-        sum += mix[index] as u32;
-    }
-    mix[3] = (255 - sum).min(255) as u8;
-
-    mix
-}
+// ===========================================================================
+// Тесты
+// ===========================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    // ----------------------------------------------------------------------
+    // Помощники
+    // ----------------------------------------------------------------------
+
+    /// Банка заданного размера с одним существом по геному.
+    fn jar_with(genome: CreatureGenome, size: usize) -> Jar {
+        let mut jar = Jar::with_seed(size, 7);
+        jar.creatures[0] = Some(Creature::new(genome));
+        jar
+    }
+
+    /// Банка с одним существом в нужной клетке.
+    fn jar_with_at(genome: CreatureGenome, size: usize, x: usize, y: usize) -> Jar {
+        let mut jar = Jar::with_seed(size, 7);
+        jar.creatures[x + y * size] = Some(Creature::new(genome));
+        jar
+    }
+
+    /// Геном из одного гена.
+    fn genome_of(action: CreatureAction) -> CreatureGenome {
+        CreatureGenome::from_line(vec![action])
+    }
+
+    /// Сумма минералов: в поле плюс в существах.
+    fn total_minerals(jar: &Jar) -> usize {
+        let in_field: usize = jar.minerals.iter().sum();
+        let in_creatures: usize = jar
+            .creatures
+            .iter()
+            .flatten()
+            .map(|creature| creature.minerals)
+            .sum();
+        in_field + in_creatures
+    }
+
+    /// Проверяет базовые инварианты мира после серии тиков.
+    fn assert_invariants(jar: &Jar, config: &Config) {
+        for creature in jar.creatures.iter().flatten() {
+            assert!(
+                creature.age <= config.lifetime_ticks,
+                "возраст {} превысил срок жизни {}",
+                creature.age,
+                config.lifetime_ticks
+            );
+            assert!(
+                !creature.genome.is_empty(),
+                "геном не должен оставаться пустым"
+            );
+        }
+    }
+
+    // ----------------------------------------------------------------------
+    // Симуляция: инварианты
+    // ----------------------------------------------------------------------
+
     #[test]
-    fn standard_genome_has_16_genes() {
-        assert_eq!(CreatureGenome::standard().line.len(), 16);
+    fn minerals_are_conserved_over_many_ticks() {
+        for seed in 0..12u64 {
+            let mut jar = Jar::with_seed(30, seed * 7919 + 1);
+            spawn(&mut jar, &genome_top(), &[(10, 2), (11, 2)]);
+            spawn(&mut jar, &genome_left(), &[(2, 10)]);
+
+            let before = total_minerals(&jar);
+            for _ in 0..400 {
+                jar.simulation_step();
+            }
+            let after = total_minerals(&jar);
+
+            assert_eq!(before, after, "сумма минералов изменилась на зерне {seed}");
+        }
     }
 
     #[test]
-    fn jump_adds_to_pointer_after_regular_step() {
-        let mut genome =
-            CreatureGenome::from_line(vec![CreatureAction::Jump(2), CreatureAction::PhotoGrow]);
+    fn energy_never_goes_negative() {
+        let mut jar = Jar::with_seed(20, 99);
+        spawn(&mut jar, &genome_bottom(), &[(5, 5), (6, 5)]);
 
-        let action = genome.get_action();
-        if let CreatureAction::Jump(delta) = action {
-            genome.line_pointer = apply_jump(genome.line_pointer, delta);
+        for _ in 0..300 {
+            jar.simulation_step();
         }
 
-        // get_action дал +1, Jump(2) добавил еще +2.
-        assert_eq!(genome.line_pointer, 3);
+        // Энергия появляется только от фотосинтеза и делится:
+        // ее количество ограничено суммой выращенного света.
+        let total: usize = jar
+            .creatures
+            .iter()
+            .flatten()
+            .map(|creature| creature.energy)
+            .sum();
+        let grown = MAX_PHOTOSYNTHESIS_ENERGY * 300 * 2;
+        assert!(
+            total <= grown,
+            "энергии больше, чем могло накопиться: {total}"
+        );
     }
 
     #[test]
-    fn negative_jump_does_not_underflow() {
-        assert_eq!(apply_jump(1, -5), 0);
+    fn creatures_die_at_the_end_of_their_lifetime() {
+        let config = Config {
+            lifetime_ticks: 5,
+            ..Config::default()
+        };
+        let mut jar = Jar::with_config_and_seed(10, config, 3);
+        jar.creatures[0] = Some(Creature::new(genome_of(CreatureAction::PhotoGrow)));
+
+        for _ in 0..4 {
+            jar.simulation_step();
+            assert!(jar.creatures[0].is_some(), "клетка умерла раньше срока");
+        }
+
+        jar.simulation_step();
+        assert!(
+            jar.creatures[0].is_none(),
+            "клетка прожила больше срока жизни"
+        );
+    }
+
+    #[test]
+    fn two_jars_with_the_same_seed_behave_identically() {
+        let mut first = Jar::with_seed(25, 4242);
+        let mut second = Jar::with_seed(25, 4242);
+
+        spawn(&mut first, &genome_top(), &[(10, 2), (11, 2), (12, 2)]);
+        spawn(&mut second, &genome_top(), &[(10, 2), (11, 2), (12, 2)]);
+
+        for _ in 0..250 {
+            first.simulation_step();
+            second.simulation_step();
+        }
+
+        assert_eq!(first.tick, second.tick);
+        for (index, (left, right)) in first
+            .creatures
+            .iter()
+            .zip(second.creatures.iter())
+            .enumerate()
+        {
+            match (left, right) {
+                (None, None) => {}
+                (Some(left), Some(right)) => {
+                    assert_eq!(
+                        left.energy, right.energy,
+                        "энергия разошлась в клетке {index}"
+                    );
+                    assert_eq!(
+                        left.minerals, right.minerals,
+                        "минералы разошлись в клетке {index}"
+                    );
+                    assert_eq!(left.age, right.age, "возраст разошлся в клетке {index}");
+                    assert_eq!(
+                        left.genome.genes(),
+                        right.genome.genes(),
+                        "геномы разошлись в клетке {index}"
+                    );
+                }
+                _ => panic!("клетка {index}: в одной банке есть существо, в другой нет"),
+            }
+        }
+    }
+
+    #[test]
+    fn newborns_start_at_zero_age() {
+        let config = Config {
+            split_energy: 0,
+            split_minerals: 0,
+            ..Config::default()
+        };
+        let mut jar = Jar::with_config_and_seed(10, config, 11);
+        jar.creatures[0] = Some(Creature::new(genome_of(CreatureAction::Split)));
+
+        jar.simulation_step();
+
+        // Мать осталась на месте, ребенок появился рядом.
+        let mother = jar.creatures[0].as_ref().expect("мать пропала");
+        assert_eq!(mother.age, 0, "мать должна начать с нулевого возраста");
+        assert_eq!(mother.last_action, None);
+        assert_eq!(mother.genome.pointer(), 0);
+
+        let child = jar
+            .creatures
+            .iter()
+            .enumerate()
+            .find(|(index, cell)| *index != 0 && cell.is_some())
+            .map(|(_, cell)| cell.as_ref().unwrap())
+            .expect("ребенок не появился");
+        assert_eq!(child.age, 0, "новорожденный должен иметь нулевой возраст");
+        assert_eq!(child.last_action, None);
+        assert_eq!(child.genome.pointer(), 0);
+    }
+
+    // ----------------------------------------------------------------------
+    // Симуляция: действия по отдельности
+    // ----------------------------------------------------------------------
+
+    #[test]
+    fn photosynthesis_gives_energy_near_the_edge() {
+        let size = 100;
+
+        // Клетка в самом углу получает максимум света.
+        let mut edge = jar_with_at(genome_of(CreatureAction::PhotoGrow), size, 0, 0);
+        edge.simulation_step();
+        let edge_energy = edge.creatures[0].as_ref().unwrap().energy;
+        assert_eq!(
+            edge_energy, MAX_PHOTOSYNTHESIS_ENERGY,
+            "у края должно быть максимальное освещение"
+        );
+
+        // Клетка в центре в темноте.
+        let mut center = jar_with_at(genome_of(CreatureAction::PhotoGrow), size, 50, 50);
+        center.simulation_step();
+        let center_energy = center.creatures[50 + 50 * size].as_ref().unwrap().energy;
+        assert_eq!(center_energy, 0, "в центре должно быть темно");
+    }
+
+    #[test]
+    fn eating_needs_energy_and_minerals() {
+        // Без энергии поесть нельзя.
+        let mut jar = jar_with(genome_of(CreatureAction::EatMinerals), 10);
+        jar.simulation_step();
+        let creature = jar.creatures[0].as_ref().unwrap();
+        assert_eq!(creature.energy, 0);
+        assert_eq!(creature.minerals, 0);
+        assert_eq!(jar.minerals[0], 100, "минералы в поле не тронуты");
+
+        // С энергией поесть можно: минерал переезжает в существо.
+        let mut jar = jar_with(genome_of(CreatureAction::EatMinerals), 10);
+        jar.creatures[0].as_mut().unwrap().energy = 5;
+        jar.simulation_step();
+        let creature = jar.creatures[0].as_ref().unwrap();
+        assert_eq!(creature.energy, 4, "еда стоит один энергии");
+        assert_eq!(creature.minerals, 1, "минерал должен попасть в существо");
+        assert_eq!(jar.minerals[0], 99, "в поле минералов стало меньше");
+    }
+
+    #[test]
+    fn eating_without_minerals_in_the_field_does_nothing() {
+        let mut jar = jar_with(genome_of(CreatureAction::EatMinerals), 10);
+        jar.creatures[0].as_mut().unwrap().energy = 5;
+        jar.minerals[0] = 0;
+
+        jar.simulation_step();
+
+        let creature = jar.creatures[0].as_ref().unwrap();
+        assert_eq!(creature.energy, 5, "энергия не должна тратиться зря");
+        assert_eq!(creature.minerals, 0);
+    }
+
+    #[test]
+    fn split_needs_energy_and_minerals() {
+        // Энергию не хватает: деления нет.
+        let mut jar = jar_with(genome_of(CreatureAction::Split), 10);
+        jar.creatures[0].as_mut().unwrap().energy = 99;
+        jar.creatures[0].as_mut().unwrap().minerals = 10;
+        jar.simulation_step();
+        assert_eq!(
+            jar.creatures.iter().filter(|cell| cell.is_some()).count(),
+            1,
+            "без 100 энергии делиться нельзя"
+        );
+
+        // Минералов не хватает: деления нет.
+        let mut jar = jar_with(genome_of(CreatureAction::Split), 10);
+        jar.creatures[0].as_mut().unwrap().energy = 100;
+        jar.creatures[0].as_mut().unwrap().minerals = 9;
+        jar.simulation_step();
+        assert_eq!(
+            jar.creatures.iter().filter(|cell| cell.is_some()).count(),
+            1,
+            "без 10 минералов делиться нельзя"
+        );
+    }
+
+    #[test]
+    fn split_shares_energy_and_minerals_between_children() {
+        let mut jar = jar_with(genome_of(CreatureAction::Split), 10);
+        {
+            let creature = jar.creatures[0].as_mut().unwrap();
+            creature.energy = 100;
+            creature.minerals = 11;
+        }
+
+        jar.simulation_step();
+
+        let alive: Vec<&Creature> = jar.creatures.iter().flatten().collect();
+        assert_eq!(alive.len(), 2, "должно быть две клетки");
+
+        let total_energy: usize = alive.iter().map(|creature| creature.energy).sum();
+        assert!(
+            total_energy <= 100,
+            "дети не могут получить больше энергии, чем было у матери: {total_energy}"
+        );
+        assert_eq!(total_energy, 80, "каждый ребенок получает 40 процентов");
+
+        let total_minerals: usize = alive.iter().map(|creature| creature.minerals).sum();
+        assert_eq!(total_minerals, 11, "минералы делятся без потерь");
+
+        // Неделимый остаток достается матери.
+        let mother_minerals = alive
+            .iter()
+            .find(|creature| creature.minerals > 0)
+            .map(|creature| creature.minerals)
+            .unwrap_or(0);
+        assert_eq!(
+            mother_minerals, 6,
+            "нечетный остаток минералов достается матери"
+        );
+    }
+
+    #[test]
+    fn split_at_the_corner_stays_inside_the_field() {
+        let mut jar = jar_with_at(genome_of(CreatureAction::Split), 10, 0, 0);
+        {
+            let creature = jar.creatures[0].as_mut().unwrap();
+            creature.energy = 100;
+            creature.minerals = 20;
+        }
+
+        jar.simulation_step();
+
+        // Клетка разделилась, и обе части остались внутри поля.
+        let alive: Vec<usize> = jar
+            .creatures
+            .iter()
+            .enumerate()
+            .filter(|(_, cell)| cell.is_some())
+            .map(|(index, _)| index)
+            .collect();
+
+        assert_eq!(alive.len(), 2, "после деления должно быть две клетки");
+        for index in &alive {
+            assert!(*index < jar.size * jar.size, "клетка вышла за пределы поля");
+        }
+
+        // Мать осталась на своем месте, ребенок поселился рядом.
+        assert!(jar.creatures[0].is_some(), "мать должна остаться на месте");
+        let child = alive.iter().copied().find(|index| *index != 0).unwrap();
+        let (x, y) = Grid::new(jar.size).xy(child);
+        assert!(
+            (x == 1 && y == 0) || (x == 0 && y == 1),
+            "ребенок появился не рядом с матерью: ({x}, {y})"
+        );
+    }
+
+    #[test]
+    fn split_in_a_dead_end_kills_the_cell_and_returns_minerals() {
+        let mut jar = Jar::with_seed(10, 5);
+        // Замораживаем всех соседей: делиться некуда.
+        for (dx, dy) in [(1isize, 0isize), (-1, 0), (0, 1), (0, -1)] {
+            let x = 5 + dx;
+            let y = 5 + dy;
+            if x >= 0 && y >= 0 && (x as usize) < 10 && (y as usize) < 10 {
+                jar.creatures[x as usize + y as usize * 10] =
+                    Some(Creature::new(genome_of(CreatureAction::PhotoGrow)));
+            }
+        }
+
+        jar.creatures[5 + 5 * 10] = Some(Creature::new(genome_of(CreatureAction::Split)));
+        jar.creatures[5 + 5 * 10].as_mut().unwrap().energy = 100;
+        jar.creatures[5 + 5 * 10].as_mut().unwrap().minerals = 20;
+
+        let before = total_minerals(&jar);
+        jar.simulation_step();
+        let after = total_minerals(&jar);
+
+        assert!(
+            jar.creatures[5 + 5 * 10].is_none(),
+            "в тупике клетка должна умереть"
+        );
+        assert_eq!(before, after, "минералы должны вернуться в поле");
+    }
+
+    #[test]
+    fn dying_of_old_age_returns_minerals_to_the_field() {
+        let config = Config {
+            lifetime_ticks: 3,
+            ..Config::default()
+        };
+        let mut jar = Jar::with_config_and_seed(10, config, 21);
+        jar.creatures[0] = Some(Creature::new(genome_of(CreatureAction::PhotoGrow)));
+        jar.creatures[0].as_mut().unwrap().minerals = 9;
+
+        let before = total_minerals(&jar);
+        for _ in 0..3 {
+            jar.simulation_step();
+        }
+        let after = total_minerals(&jar);
+
+        assert!(
+            jar.creatures[0].is_none(),
+            "клетка должна умереть от старости"
+        );
+        assert_eq!(before, after, "минералы должны вернуться в поле");
+    }
+
+    #[test]
+    fn jump_moves_the_dna_pointer() {
+        let mut jar = jar_with(
+            CreatureGenome::from_line(vec![
+                CreatureAction::Jump(2),
+                CreatureAction::PhotoGrow,
+                CreatureAction::PhotoGrow,
+            ]),
+            10,
+        );
+
+        jar.simulation_step();
+
+        // get_action дал +1, Jump(2) добавил еще +2.
+        assert_eq!(jar.creatures[0].as_ref().unwrap().genome.pointer(), 3);
+    }
+
+    #[test]
+    fn last_action_is_recorded_and_tick_grows() {
+        let mut jar = jar_with(genome_of(CreatureAction::PhotoGrow), 10);
+        assert_eq!(jar.tick, 0);
+
+        jar.simulation_step();
+
+        assert_eq!(jar.tick, 1, "тик должен увеличиваться");
+        assert_eq!(
+            jar.creatures[0].as_ref().unwrap().last_action,
+            Some(CreatureAction::PhotoGrow),
+            "действие должно записываться"
+        );
+    }
+
+    // ----------------------------------------------------------------------
+    // Геном
+    // ----------------------------------------------------------------------
+
+    #[test]
+    fn empty_genome_is_rejected() {
+        let result = std::panic::catch_unwind(|| {
+            CreatureGenome::from_line(vec![]);
+        });
+        assert!(result.is_err(), "пустой геном должен отклоняться");
+    }
+
+    #[test]
+    fn dna_pointer_wraps_around_the_genome() {
+        let mut genome =
+            CreatureGenome::from_line(vec![CreatureAction::PhotoGrow, CreatureAction::EatMinerals]);
+
+        let first = genome.get_action();
+        let second = genome.get_action();
+        let third = genome.get_action();
+
+        assert_eq!(first, CreatureAction::PhotoGrow);
+        assert_eq!(second, CreatureAction::EatMinerals);
+        assert_eq!(
+            third,
+            CreatureAction::PhotoGrow,
+            "указатель должен оборачиваться"
+        );
+    }
+
+    #[test]
+    fn insert_mutation_makes_the_genome_longer() {
+        let mut rng = Rng::new(5);
+        let mut genome = CreatureGenome::standard();
+
+        for _ in 0..50 {
+            let before = genome.len();
+            genome.apply_mutation(MutationKind::Insert, &mut rng);
+            assert_eq!(genome.len(), before + 1, "вставка добавляет один ген");
+        }
+    }
+
+    #[test]
+    fn remove_mutation_makes_the_genome_shorter() {
+        let mut rng = Rng::new(6);
+        let mut genome = CreatureGenome::standard();
+
+        for _ in 0..15 {
+            let before = genome.len();
+            genome.apply_mutation(MutationKind::Remove, &mut rng);
+            assert_eq!(genome.len(), before - 1, "удаление убирает один ген");
+        }
+    }
+
+    #[test]
+    fn replace_mutation_keeps_the_genome_length() {
+        let mut rng = Rng::new(7);
+        let mut genome = CreatureGenome::standard();
+
+        for _ in 0..50 {
+            let before = genome.len();
+            genome.apply_mutation(MutationKind::Replace, &mut rng);
+            assert_eq!(genome.len(), before, "замена не меняет длину генома");
+        }
+    }
+
+    #[test]
+    fn jump_mutation_changes_the_jump_value() {
+        let mut rng = Rng::new(8);
+        let mut genome = CreatureGenome::from_line(vec![CreatureAction::Jump(1)]);
+
+        for _ in 0..50 {
+            let before = genome.genes()[0];
+            genome.apply_mutation(MutationKind::Jump, &mut rng);
+            assert_ne!(genome.genes()[0], before, "значение прыжка должно меняться");
+            if let CreatureAction::Jump(value) = genome.genes()[0] {
+                assert!(value != 0, "нулевой прыжок бессмысленен");
+                assert!((-4..=4).contains(&value), "значение вне диапазона: {value}");
+            }
+        }
+    }
+
+    #[test]
+    fn random_jump_delta_is_never_zero() {
+        let mut rng = Rng::new(9);
+        for _ in 0..1000 {
+            let delta = random_jump_delta(&mut rng);
+            assert_ne!(delta, 0, "дельта прыжка не должна быть нулевой");
+            assert!((-4..=4).contains(&delta), "дельта вне диапазона: {delta}");
+        }
+    }
+
+    #[test]
+    fn random_action_produces_all_kinds() {
+        let mut rng = Rng::new(10);
+        let mut seen = [false; ActionKind::COUNT];
+
+        for _ in 0..500 {
+            seen[random_action(&mut rng).kind().index()] = true;
+        }
+
+        for (index, found) in seen.iter().enumerate() {
+            assert!(
+                *found,
+                "тип гена {} ни разу не выпал",
+                ActionKind::ALL[index].label()
+            );
+        }
+    }
+
+    #[test]
+    fn chance_percent_has_the_expected_edges() {
+        let mut rng = Rng::new(11);
+
+        for _ in 0..200 {
+            assert!(
+                !rng.chance_percent(0),
+                "шанс 0 процентов не должен срабатывать"
+            );
+            assert!(
+                rng.chance_percent(100),
+                "шанс 100 процентов должен срабатывать"
+            );
+        }
+    }
+
+    #[test]
+    fn split_does_not_create_energy_out_of_thin_air() {
+        let mut rng = Rng::new(12);
+        let config = Config::default();
+
+        let mut mother = Creature::new(CreatureGenome::standard());
+        mother.energy = 100;
+        mother.minerals = 20;
+
+        let (first, second) = mother.split(&mut rng, &config);
+
+        assert!(
+            first.energy + second.energy <= mother.energy,
+            "суммарная энергия детей превысила энергию матери"
+        );
+        assert_eq!(first.minerals + second.minerals, mother.minerals);
+    }
+
+    // ----------------------------------------------------------------------
+    // Чистые функции
+    // ----------------------------------------------------------------------
+
+    #[test]
+    fn light_level_is_maximum_at_the_edge() {
+        let size = 100;
+        assert_eq!(
+            light_level(0, 0, size, MAX_PHOTOSYNTHESIS_ENERGY),
+            MAX_PHOTOSYNTHESIS_ENERGY
+        );
+        assert_eq!(
+            light_level(99, 50, size, MAX_PHOTOSYNTHESIS_ENERGY),
+            MAX_PHOTOSYNTHESIS_ENERGY
+        );
+        assert_eq!(
+            light_level(50, 0, size, MAX_PHOTOSYNTHESIS_ENERGY),
+            MAX_PHOTOSYNTHESIS_ENERGY
+        );
+        assert_eq!(
+            light_level(50, 99, size, MAX_PHOTOSYNTHESIS_ENERGY),
+            MAX_PHOTOSYNTHESIS_ENERGY
+        );
+    }
+
+    #[test]
+    fn light_fades_towards_the_center_and_stops_at_reach() {
+        let size = 100;
+        let reach = light_reach(size);
+
+        assert_eq!(
+            light_level(reach, reach, size, MAX_PHOTOSYNTHESIS_ENERGY),
+            0
+        );
+        assert_eq!(
+            light_level(reach + 10, reach + 10, size, MAX_PHOTOSYNTHESIS_ENERGY),
+            0
+        );
+
+        // Свет только убывает от края к центру.
+        let mut previous = MAX_PHOTOSYNTHESIS_ENERGY + 1;
+        for distance in 0..reach {
+            let level = light_level(distance, 0, size, MAX_PHOTOSYNTHESIS_ENERGY);
+            assert!(
+                level <= previous,
+                "освещенность растет с расстоянием: {distance}"
+            );
+            previous = level;
+        }
+    }
+
+    #[test]
+    fn light_level_works_on_tiny_fields() {
+        for size in 1..=4 {
+            for x in 0..size {
+                for y in 0..size {
+                    let level = light_level(x, y, size, MAX_PHOTOSYNTHESIS_ENERGY);
+                    assert!(
+                        level <= MAX_PHOTOSYNTHESIS_ENERGY,
+                        "свет не может быть больше максимума"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn light_table_agrees_with_light_level() {
+        let size = 100;
+        let cell = 8;
+        let reach = light_reach(size);
+        let table = build_light_table(reach as u32 * cell, cell, size);
+
+        // Обе шкалы считают свет по одной формуле, поэтому на большом
+        // числе ступеней они совпадают: 255 уровней - это как раз шкала
+        // таблицы освещенности.
+        const SCALE: usize = 255;
+
+        for distance in 0..reach {
+            // Клетка на расстоянии `distance` от края: и по горизонтали,
+            // и по вертикали.
+            let level = light_level(distance, distance, size, SCALE);
+            let from_table = table[distance * cell as usize] as usize;
+            assert!(
+                level.abs_diff(from_table) <= 1,
+                "свет в клетке {distance} не совпал с таблицей: {level} против {from_table}"
+            );
+        }
+    }
+
+    #[test]
+    fn light_level_is_quantized_by_the_energy_scale() {
+        let size = 100;
+
+        // Свет в клетке не может быть больше максимума энергии за тик.
+        for distance in 0..light_reach(size) {
+            let level = light_level(distance, 0, size, MAX_PHOTOSYNTHESIS_ENERGY);
+            assert!(
+                level <= MAX_PHOTOSYNTHESIS_ENERGY,
+                "свет превысил максимум энергии: {level}"
+            );
+        }
+    }
+
+    #[test]
+    fn speed_changes_in_both_directions() {
+        assert_eq!(
+            Speed::TicksPerFrame(1).slower(),
+            Speed::FramesPerTick(2),
+            "замедление переводит в режим один тик на два кадра"
+        );
+        assert_eq!(
+            Speed::FramesPerTick(2).faster(),
+            Speed::TicksPerFrame(1),
+            "ускорение возвращает в режим тик за кадр"
+        );
+        assert_eq!(Speed::TicksPerFrame(3).faster(), Speed::TicksPerFrame(4));
+        assert_eq!(Speed::TicksPerFrame(3).slower(), Speed::TicksPerFrame(2));
+        assert_eq!(Speed::FramesPerTick(4).slower(), Speed::FramesPerTick(5));
+    }
+
+    #[test]
+    fn speed_saturates_at_the_limits() {
+        assert_eq!(
+            Speed::FramesPerTick(MAX_FRAMES_PER_TICK).slower(),
+            Speed::FramesPerTick(MAX_FRAMES_PER_TICK),
+            "замедление упирается в потолок"
+        );
+        assert_eq!(
+            Speed::TicksPerFrame(MAX_SPEED).faster(),
+            Speed::TicksPerFrame(MAX_SPEED),
+            "ускорение упирается в потолок"
+        );
+    }
+
+    #[test]
+    fn view_mode_cycles_through_all_modes() {
+        let mut mode = ViewMode::Creatures;
+        let mut seen = Vec::new();
+
+        for _ in 0..ViewMode::ALL.len() {
+            assert!(!seen.contains(&mode), "режим {mode:?} повторился");
+            seen.push(mode);
+            mode = mode.next();
+        }
+
+        assert_eq!(
+            mode,
+            ViewMode::Creatures,
+            "после полного круга должен снова быть первый режим"
+        );
+        assert_eq!(seen.len(), ViewMode::ALL.len());
+    }
+
+    #[test]
+    fn view_mode_labels_are_unique() {
+        let mut labels = Vec::new();
+        for mode in ViewMode::ALL {
+            assert!(!labels.contains(&mode.label()), "метка повторилась");
+            labels.push(mode.label());
+        }
+    }
+
+    #[test]
+    fn format_count_switches_units_at_the_right_boundaries() {
+        assert_eq!(format_count(0), "0");
+        assert_eq!(format_count(999), "999");
+        assert_eq!(format_count(9_999), "9999");
+        assert_eq!(format_count(10_000), "10.0k");
+        assert_eq!(format_count(42_000), "42.0k");
+        assert_eq!(format_count(999_999), "1.0m");
+        assert_eq!(format_count(1_000_000), "1.0m");
+        assert_eq!(format_count(2_500_000), "2.5m");
+    }
+
+    #[test]
+    fn scale_and_mul255_match_the_exact_formula() {
+        for value in 0..=255u32 {
+            for factor in 0..=255u32 {
+                let expected = (value * factor + 127) / 255;
+
+                let scaled = mul255(value, factor);
+                assert!(
+                    scaled.abs_diff(expected) <= 1,
+                    "mul255({value}, {factor}) = {scaled}, ожидалось {expected}"
+                );
+
+                let color = rgb(value as u8, value as u8, value as u8);
+                let scaled_color = scale(color, factor);
+                let channel = (scaled_color >> 16) & 0xFF;
+                assert!(
+                    channel.abs_diff(expected) <= 1,
+                    "scale({value}, {factor}) дал {channel}, ожидалось {expected}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ramp_hits_its_stop_points() {
+        for stop in MINERAL_RAMP.iter() {
+            let (value, color) = *stop;
+            assert_eq!(
+                ramp(value, &MINERAL_RAMP),
+                rgb(color.0 as u8, color.1 as u8, color.2 as u8),
+                "минералы: стоп {value}"
+            );
+        }
+
+        for stop in ENERGY_RAMP.iter() {
+            let (value, color) = *stop;
+            assert_eq!(
+                ramp(value, &ENERGY_RAMP),
+                rgb(color.0 as u8, color.1 as u8, color.2 as u8),
+                "энергия: стоп {value}"
+            );
+        }
+
+        assert_eq!(ramp(0, &MINERAL_RAMP), rgb(207, 227, 245));
+        assert_eq!(ramp(255, &MINERAL_RAMP), rgb(18, 63, 126));
+        assert_eq!(ramp(0, &ENERGY_RAMP), rgb(255, 224, 184));
+        assert_eq!(ramp(255, &ENERGY_RAMP), rgb(122, 46, 8));
+    }
+
+    #[test]
+    fn ramp_clamps_out_of_range_values() {
+        assert_eq!(ramp(1000, &MINERAL_RAMP), ramp(255, &MINERAL_RAMP));
+        assert_eq!(ramp(1000, &ENERGY_RAMP), ramp(255, &ENERGY_RAMP));
+    }
+
+    #[test]
+    fn ramps_are_ordered_by_lightness() {
+        for stops in [&MINERAL_RAMP[..], &ENERGY_RAMP[..]] {
+            let mut previous = luma(ramp(0, stops));
+            for t in 1..=255 {
+                let current = luma(ramp(t, stops));
+                assert!(
+                    current <= previous,
+                    "шкала не упорядочена по светлоте на значении {t}"
+                );
+                previous = current;
+            }
+        }
+    }
+
+    #[test]
+    fn light_color_matches_the_ramp() {
+        for intensity in 0..=255u8 {
+            assert_eq!(
+                light_color(intensity),
+                ramp(intensity as u32, &LIGHT_RAMP),
+                "цвета освещенности разошлись на значении {intensity}"
+            );
+        }
+    }
+
+    #[test]
+    fn hsv_to_rgb_maps_the_primary_colors() {
+        let red = hsv_to_rgb(0.0, 1.0, 1.0);
+        assert_eq!(red >> 16, 0xFF, "нулевой тон должен быть красным");
+        assert_eq!(red & 0xFF, 0, "нулевой тон не должен содержать синего");
+
+        let green = hsv_to_rgb(120.0, 1.0, 1.0);
+        assert_eq!(
+            (green >> 8) & 0xFF,
+            0xFF,
+            "120 градусов должен быть зеленым"
+        );
+        assert_eq!(green >> 16, 0, "120 градусов не должен содержать красного");
+
+        let blue = hsv_to_rgb(240.0, 1.0, 1.0);
+        assert_eq!(blue & 0xFF, 0xFF, "240 градусов должен быть синим");
+        assert_eq!(blue >> 16, 0, "240 градусов не должен содержать красного");
+    }
+
+    #[test]
+    fn hsv_to_rgb_wraps_around_the_circle() {
+        assert_eq!(hsv_to_rgb(360.0, 1.0, 1.0), hsv_to_rgb(0.0, 1.0, 1.0));
+        assert_eq!(hsv_to_rgb(-120.0, 1.0, 1.0), hsv_to_rgb(240.0, 1.0, 1.0));
+    }
+
+    #[test]
+    fn genome_mix_of_an_empty_genome_is_all_zero() {
+        // Пустой геном создать нельзя, поэтому проверяем напрямую:
+        // у настоящего генома доли всегда в сумме дают 255.
+        let genome = CreatureGenome::standard();
+        let mix = genome_mix(&genome);
+        assert_eq!(mix.iter().map(|share| *share as u32).sum::<u32>(), 255);
+    }
+
+    #[test]
+    fn genome_mix_does_not_invent_a_jump_share() {
+        // В геноме без прыжков доля прыжков должна остаться нулевой.
+        let genome = CreatureGenome::from_line(vec![
+            CreatureAction::PhotoGrow,
+            CreatureAction::PhotoGrow,
+            CreatureAction::EatMinerals,
+        ]);
+        let mix = genome_mix(&genome);
+
+        assert_eq!(
+            mix[ActionKind::Jump.index()],
+            0,
+            "прыжков в геноме нет, но доля появилась"
+        );
+        assert_eq!(mix.iter().map(|share| *share as u32).sum::<u32>(), 255);
+    }
+
+    #[test]
+    fn mix_label_and_action_label_cover_all_variants() {
+        assert_eq!(action_label(None), "-");
+        for kind in ActionKind::ALL {
+            let action = match kind {
+                ActionKind::PhotoGrow => CreatureAction::PhotoGrow,
+                ActionKind::EatMinerals => CreatureAction::EatMinerals,
+                ActionKind::Split => CreatureAction::Split,
+                ActionKind::Jump => CreatureAction::Jump(1),
+            };
+            assert_eq!(action_label(Some(action)), kind.label());
+        }
+
+        assert_eq!(mix_label(None), "-");
+        let label = mix_label(Some([255, 0, 0, 0]));
+        assert!(label.contains("photo 100%"), "подпись состава: {label}");
+        assert!(label.contains("jump 0%"), "подпись состава: {label}");
+    }
+
+    // ----------------------------------------------------------------------
+    // Интерфейс: ввод и камера
+    // ----------------------------------------------------------------------
+
+    #[test]
+    fn releasing_one_key_keeps_the_other_pressed() {
+        let mut app = App::new(Jar::new(20));
+        app.camera.set_window_size(800, 800);
+        app.camera.set_cell_size(64);
+
+        app.press_direction(Direction::Right);
+        app.press_direction(Direction::Down);
+        app.release_direction(Direction::Right);
+
+        assert!(
+            app.keys.is_held(),
+            "после отпускания Right клавиша Down должна остаться нажатой"
+        );
+    }
+
+    #[test]
+    fn releasing_the_last_key_stops_the_repeat() {
+        let mut app = App::new(Jar::new(20));
+        app.camera.set_window_size(800, 800);
+        app.camera.set_cell_size(64);
+
+        app.press_direction(Direction::Right);
+        app.release_direction(Direction::Right);
+
+        assert!(!app.keys.is_held(), "автоповтор должен остановиться");
+    }
+
+    #[test]
+    fn zoom_in_and_out_returns_to_the_same_size() {
+        let mut app = App::new(Jar::new(20));
+        app.camera.set_window_size(800, 800);
+
+        let before = app.camera.cell_size;
+        app.zoom(1);
+        assert_ne!(app.camera.cell_size, before, "зум должен измениться");
+        app.zoom(-1);
+        assert_eq!(
+            app.camera.cell_size, before,
+            "шаг туда и шаг обратно должен вернуть тот же размер"
+        );
+    }
+
+    #[test]
+    fn zoom_saturates_at_the_limits() {
+        let mut app = App::new(Jar::new(20));
+        app.camera.set_window_size(800, 800);
+
+        for _ in 0..50 {
+            app.zoom(1);
+        }
+        assert_eq!(app.camera.cell_size, MAX_CELL_SIZE);
+
+        for _ in 0..50 {
+            app.zoom(-1);
+        }
+        assert_eq!(app.camera.cell_size, MIN_CELL_SIZE);
+    }
+
+    #[test]
+    fn press_moves_once_and_repeat_takes_over_later() {
+        let mut app = App::new(Jar::new(20));
+        app.camera.set_window_size(800, 800);
+        app.camera.set_cell_size(64);
+        app.camera.cursor_x = 10;
+
+        let now = Instant::now();
+        app.press_direction(Direction::Right);
+        assert_eq!(
+            app.camera.cursor_x, 11,
+            "нажатие должно сдвинуть на одну клетку"
+        );
+        assert!(app.keys.is_held());
+
+        // До истечения задержки автоповтора ничего не происходит.
+        assert_eq!(app.keys.poll(now), None);
+        assert_eq!(app.camera.cursor_x, 11);
+
+        // После задержки выделение едет само.
+        assert_eq!(
+            app.keys.poll(now + REPEAT_DELAY + Duration::from_millis(1)),
+            Some(Direction::Right)
+        );
+    }
+
+    #[test]
+    fn command_is_recognized_by_key() {
+        assert_eq!(
+            command_from_key(PhysicalKey::Code(KeyCode::Space)),
+            Some(Command::TogglePause)
+        );
+        assert_eq!(
+            command_from_key(PhysicalKey::Code(KeyCode::Tab)),
+            Some(Command::NextView)
+        );
+        assert_eq!(
+            command_from_key(PhysicalKey::Code(KeyCode::KeyF)),
+            Some(Command::FitZoom)
+        );
+        assert_eq!(
+            command_from_key(PhysicalKey::Code(KeyCode::Equal)),
+            Some(Command::SpeedUp)
+        );
+        assert_eq!(
+            command_from_key(PhysicalKey::Code(KeyCode::Minus)),
+            Some(Command::SpeedDown)
+        );
+        assert_eq!(command_from_key(PhysicalKey::Code(KeyCode::KeyW)), None);
+    }
+
+    #[test]
+    fn direction_is_recognized_by_key() {
+        assert_eq!(
+            Direction::from_key(PhysicalKey::Code(KeyCode::KeyW)),
+            Some(Direction::Up)
+        );
+        assert_eq!(
+            Direction::from_key(PhysicalKey::Code(KeyCode::ArrowRight)),
+            Some(Direction::Right)
+        );
+        assert_eq!(Direction::from_key(PhysicalKey::Code(KeyCode::Space)), None);
+    }
+
+    #[test]
+    fn clock_runs_the_right_number_of_ticks() {
+        let now = Instant::now();
+
+        // Один тик за кадр.
+        let mut clock = SimClock::new(now);
+        assert_eq!(clock.ticks_due(now), 1);
+
+        // Пауза: тиков нет.
+        let mut clock = SimClock::new(now);
+        clock.toggle_pause(now);
+        assert_eq!(clock.ticks_due(now + FRAME_TIME * 10), 0);
+        clock.toggle_pause(now + FRAME_TIME * 10);
+        assert_eq!(clock.ticks_due(now + FRAME_TIME * 10), 1);
+
+        // Несколько тиков за кадр.
+        let mut clock = SimClock::new(now);
+        clock.set_speed(Speed::TicksPerFrame(3));
+        assert_eq!(clock.ticks_due(now), 3);
+
+        // Один тик раз в четыре кадра.
+        let mut clock = SimClock::new(now);
+        clock.set_speed(Speed::FramesPerTick(4));
+        let mut ticks = 0;
+        for frame in 0..8 {
+            ticks += clock.ticks_due(now + FRAME_TIME * frame);
+        }
+        assert_eq!(ticks, 2, "за восемь кадров должно быть два тика");
+    }
+
+    #[test]
+    fn set_cell_size_clamps_and_moves_the_cursor_when_the_field_stops_fitting() {
+        let mut app = App::new(Jar::new(20));
+        app.camera.set_window_size(800, 800);
+        app.camera.set_cell_size(8);
+        assert!(
+            !app.camera.selection_active(),
+            "поле помещается, выделения быть не должно"
+        );
+
+        app.camera.set_cell_size(64);
+
+        assert!(app.camera.selection_active());
+        assert_eq!(
+            (app.camera.cursor_x, app.camera.cursor_y),
+            (10, 10),
+            "выделение должно появиться в центре вида"
+        );
+
+        // Обратный переход курсор не двигает.
+        let cursor = (app.camera.cursor_x, app.camera.cursor_y);
+        app.camera.set_cell_size(8);
+        assert_eq!(
+            (app.camera.cursor_x, app.camera.cursor_y),
+            cursor,
+            "курсор не должен двигаться"
+        );
+    }
+
+    #[test]
+    fn flash_marks_cells_that_changed() {
+        let jar = Jar::with_seed(20, 0xC0FFEE);
+
+        let mut app = App::new(jar);
+        app.update_flashes();
+        assert!(
+            app.flashes.iter().all(|flash| *flash == 0),
+            "вспышки появились без изменений"
+        );
+
+        // Появилась новая клетка — на её месте вспышка.
+        let index = 9 + 2 * 20;
+        app.jar.creatures[index] = Some(Creature::new(genome_top()));
+        app.refresh_snapshot();
+        app.update_flashes();
+
+        assert!(app.flashes[index] > 0, "рождение клетки не вызвало вспышку");
+        assert!(
+            app.flashes[8 + 2 * 20] == 0,
+            "вспышка появилась на пустой клетке"
+        );
+    }
+
+    #[test]
+    fn flash_fades_out_after_a_few_frames() {
+        let jar = Jar::with_seed(20, 0xC0FFEE);
+        let mut app = App::new(jar);
+
+        let index = 9 + 2 * 20;
+        app.jar.creatures[index] = Some(Creature::new(genome_top()));
+        app.refresh_snapshot();
+
+        // Вспышка загорелась на полную силу.
+        assert_eq!(
+            app.flashes[index], FLASH_FRAMES,
+            "вспышка должна начаться с полной силы"
+        );
+
+        // И гаснет по одному кадру.
+        for frame in 1..=FLASH_FRAMES {
+            app.update_flashes();
+            assert_eq!(
+                app.flashes[index],
+                FLASH_FRAMES - frame,
+                "вспышка должна гаснуть по кадру"
+            );
+        }
+        assert_eq!(app.flashes[index], 0, "вспышка должна погаснуть");
+    }
+
+    #[test]
+    fn title_text_shows_the_state_of_the_app() {
+        let mut app = App::new(Jar::new(20));
+        app.camera.set_window_size(800, 800);
+
+        let title = app.title_text();
+        assert!(title.contains("tick 0"), "заголовок: {title}");
+        assert!(title.contains("pop 0"), "заголовок: {title}");
+        assert!(title.contains("zoom fit"), "заголовок: {title}");
+        assert!(!title.contains("paused"), "заголовок: {title}");
+
+        app.toggle_pause();
+        assert!(
+            app.title_text().contains("paused"),
+            "пауза должна быть видна"
+        );
+
+        app.toggle_pause();
+        app.camera.set_cell_size(64);
+        assert!(
+            app.title_text().contains("zoom x"),
+            "заголовок: {}",
+            app.title_text()
+        );
+    }
+
+    // ----------------------------------------------------------------------
+    // Отрисовка
+    // ----------------------------------------------------------------------
+
+    /// Поле из одной клетки с одним существом.
+    fn small_snapshot(size: usize) -> JarSnapshot {
+        let mut jar = Jar::with_seed(size, 1);
+        jar.creatures[0] = Some(Creature::new(genome_top()));
+        jar.snapshot()
+    }
+
+    /// Пиксель буфера по координатам.
+    fn pixel_at(buffer: &[u32], width: u32, x: i64, y: i64) -> u32 {
+        buffer[(y * width as i64 + x) as usize]
+    }
+
+    /// Левый верхний угол поля в пикселях окна.
+    ///
+    /// Поле всегда по центру, пока помещается в окно целиком.
+    fn field_origin(width: u32, height: u32, side: u32) -> (i64, i64) {
+        (
+            (width as i64 - side as i64) / 2,
+            (height as i64 - side as i64) / 2,
+        )
+    }
+
+    #[test]
+    fn draw_frame_never_writes_outside_the_buffer() {
+        for view in ViewMode::ALL {
+            for cell_size in [3u32, 8, 64] {
+                for (width, height) in [(320u32, 320u32), (800, 800), (137, 61)] {
+                    let snapshot = small_snapshot(20);
+                    let mut buffer = vec![0u32; (width * height) as usize];
+
+                    draw_frame(
+                        &mut buffer,
+                        width,
+                        height,
+                        &snapshot,
+                        view,
+                        cell_size,
+                        (0, 0),
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn canvas_fill_rect_clips_to_the_window() {
+        let mut buffer = vec![0u32; 10 * 10];
+
+        // Полностью за пределами окна: ничего не меняется.
+        {
+            let mut canvas = Canvas {
+                buffer: &mut buffer,
+                width: 10,
+                height: 10,
+            };
+            canvas.fill_rect(20, 20, 5, 5, 0x00FF_0000);
+        }
+        assert!(buffer.iter().all(|pixel| *pixel == 0));
+
+        // Частично за пределами окна: закрашивается только видимая часть.
+        {
+            let mut canvas = Canvas {
+                buffer: &mut buffer,
+                width: 10,
+                height: 10,
+            };
+            canvas.fill_rect(8, 8, 5, 5, 0x00FF_0000);
+        }
+        let changed = buffer.iter().filter(|pixel| **pixel == 0x00FF_0000).count();
+        assert_eq!(changed, 4, "закрашено должно быть ровно 4 пикселя");
+
+        // Отрицательные координаты: обрезаются по левому и верхнему краю.
+        {
+            let mut canvas = Canvas {
+                buffer: &mut buffer,
+                width: 10,
+                height: 10,
+            };
+            canvas.fill_rect(-2, -2, 4, 4, 0x0000_FF00);
+        }
+        let changed = buffer.iter().filter(|pixel| **pixel == 0x0000_FF00).count();
+        assert_eq!(changed, 4, "закрашено должно быть ровно 4 пикселя");
+
+        // Нулевой размер: ничего не происходит.
+        {
+            let mut canvas = Canvas {
+                buffer: &mut buffer,
+                width: 10,
+                height: 10,
+            };
+            canvas.fill_rect(0, 0, 0, 0, 0x0000_00FF);
+        }
+        assert!(!buffer.contains(&0x0000_00FF));
+    }
+
+    #[test]
+    fn creature_cell_is_painted_in_the_creature_color() {
+        let size = 5u32;
+        let snapshot = small_snapshot(size as usize);
+        let palette = Palette::new();
+
+        let width = 400;
+        let height = 400;
+        let mut buffer = vec![0u32; (width * height) as usize];
+        draw_frame(
+            &mut buffer,
+            width,
+            height,
+            &snapshot,
+            ViewMode::Creatures,
+            8,
+            (0, 0),
+        );
+
+        // Поле 5x5 клеток по 8 пикселей: смещение от края окна.
+        let (offset_x, offset_y) = field_origin(width, height, size * 8);
+        let pixel = pixel_at(&buffer, width, offset_x + 4, offset_y + 4);
+
+        assert_eq!(
+            pixel, palette.creature,
+            "клетка с существом должна быть покрашена в цвет существа"
+        );
+    }
+
+    #[test]
+    fn empty_cell_is_painted_in_the_jar_background() {
+        let size = 5u32;
+        let snapshot = small_snapshot(size as usize);
+        let palette = Palette::new();
+
+        let width = 400;
+        let height = 400;
+        let mut buffer = vec![0u32; (width * height) as usize];
+        draw_frame(
+            &mut buffer,
+            width,
+            height,
+            &snapshot,
+            ViewMode::Creatures,
+            8,
+            (0, 0),
+        );
+
+        let (offset_x, offset_y) = field_origin(width, height, size * 8);
+        // Клетка (4, 4) пустая: под ней нет существа.
+        let pixel = pixel_at(&buffer, width, offset_x + 4 * 8 + 4, offset_y + 4 * 8 + 4);
+
+        assert_eq!(
+            pixel, palette.jar_bg,
+            "пустая клетка должна быть цвета фона банки"
+        );
+    }
+
+    #[test]
+    fn jar_frame_is_painted_around_the_field() {
+        let size = 5u32;
+        let snapshot = small_snapshot(size as usize);
+        let palette = Palette::new();
+
+        let width = 400;
+        let height = 400;
+        let mut buffer = vec![0u32; (width * height) as usize];
+        draw_frame(
+            &mut buffer,
+            width,
+            height,
+            &snapshot,
+            ViewMode::Creatures,
+            8,
+            (0, 0),
+        );
+
+        let (offset_x, offset_y) = field_origin(width, height, size * 8);
+        let pixel = pixel_at(&buffer, width, offset_x, offset_y);
+
+        assert_eq!(
+            pixel, palette.jar_frame,
+            "угол рамки банки должен быть цвета рамки"
+        );
+    }
+
+    #[test]
+    fn colony_outline_draws_four_sides_for_a_lone_cell() {
+        let mut jar = Jar::with_seed(5, 1);
+        jar.creatures[2 + 2 * 5] = Some(Creature::new(genome_top()));
+        let snapshot = jar.snapshot();
+
+        let width = 400u32;
+        let height = 400u32;
+        let mut buffer = vec![0u32; (width * height) as usize];
+        draw_frame(
+            &mut buffer,
+            width,
+            height,
+            &snapshot,
+            ViewMode::Creatures,
+            8,
+            (0, 0),
+        );
+
+        let (offset_x, offset_y) = field_origin(width, height, 5 * 8);
+        let cell = 8i64;
+        let x = offset_x + 2 * cell;
+        let y = offset_y + 2 * cell;
+        let frame = Palette::new().jar_frame;
+
+        assert_eq!(pixel_at(&buffer, width, x, y), frame, "нет верхней стороны");
+        assert_eq!(
+            pixel_at(&buffer, width, x, y + cell - 1),
+            frame,
+            "нет нижней стороны"
+        );
+        assert_eq!(pixel_at(&buffer, width, x, y), frame, "нет левой стороны");
+        assert_eq!(
+            pixel_at(&buffer, width, x + cell - 1, y),
+            frame,
+            "нет правой стороны"
+        );
+    }
+
+    #[test]
+    fn colony_outline_has_no_line_between_neighbours() {
+        let mut jar = Jar::with_seed(5, 1);
+        jar.creatures[2 + 2 * 5] = Some(Creature::new(genome_top()));
+        jar.creatures[3 + 2 * 5] = Some(Creature::new(genome_top()));
+        let snapshot = jar.snapshot();
+
+        let width = 400u32;
+        let height = 400u32;
+        let mut buffer = vec![0u32; (width * height) as usize];
+        draw_frame(
+            &mut buffer,
+            width,
+            height,
+            &snapshot,
+            ViewMode::Creatures,
+            8,
+            (0, 0),
+        );
+
+        let (offset_x, offset_y) = field_origin(width, height, 5 * 8);
+        let cell = 8i64;
+
+        // Между соседними клетками линии быть не должно.
+        // Проверяем середину общей границы, а не ее верхний край:
+        // верхняя граница клетки всегда обведена.
+        let between = offset_x + 3 * cell;
+        let pixel = pixel_at(&buffer, width, between, offset_y + 2 * cell + cell / 2);
+        assert_ne!(
+            pixel,
+            Palette::new().jar_frame,
+            "между соседними клетками не должно быть линии"
+        );
+    }
+
+    #[test]
+    fn cursor_draws_corners_and_keeps_the_cell_centre() {
+        let snapshot = small_snapshot(20);
+        let palette = Palette::new();
+
+        let width = 400u32;
+        let height = 400u32;
+        let mut buffer = vec![0u32; (width * height) as usize];
+        // Размер клетки 32: поле 20x32 = 640 пикселей не влезает в окно,
+        // значит выделение есть.
+        draw_frame(
+            &mut buffer,
+            width,
+            height,
+            &snapshot,
+            ViewMode::Creatures,
+            32,
+            (0, 0),
+        );
+
+        let cell = 32i64;
+        // Камера следует за курсором: он всегда в середине экрана.
+        let (offset_x, offset_y) = field_offset((0, 0), 20, 32, width, height);
+
+        // Уголки нарисованы.
+        assert_ne!(
+            pixel_at(&buffer, width, offset_x, offset_y),
+            palette.jar_bg,
+            "левый верхний уголок"
+        );
+        assert_ne!(
+            pixel_at(&buffer, width, offset_x + cell - 1, offset_y),
+            palette.jar_bg,
+            "правый верхний уголок"
+        );
+        assert_ne!(
+            pixel_at(&buffer, width, offset_x, offset_y + cell - 1),
+            palette.jar_bg,
+            "левый нижний уголок"
+        );
+        assert_ne!(
+            pixel_at(&buffer, width, offset_x + cell - 1, offset_y + cell - 1),
+            palette.jar_bg,
+            "правый нижний уголок"
+        );
+
+        // Центр клетки не закрашен: там остается цвет самой клетки.
+        let under = cell_color(&snapshot, 0, ViewMode::Creatures, &palette);
+        assert_eq!(
+            pixel_at(&buffer, width, offset_x + cell / 2, offset_y + cell / 2),
+            under,
+            "центр клетки должен остаться чистым"
+        );
+    }
+
+    #[test]
+    fn minimap_stays_inside_its_frame_for_any_field_size() {
+        for size in [20usize, 100, 150] {
+            let snapshot = small_snapshot(size);
+            let palette = Palette::new();
+
+            let width = 400u32;
+            let height = 400u32;
+            let mut buffer = vec![0u32; (width * height) as usize];
+            draw_frame(
+                &mut buffer,
+                width,
+                height,
+                &snapshot,
+                ViewMode::Creatures,
+                4,
+                (0, 0),
+            );
+
+            let x = (width - MINIMAP_SIZE - PANEL_MARGIN) as i64;
+            let y = PANEL_MARGIN as i64;
+
+            // Рамка мини-карты на месте.
+            let border = pixel_at(&buffer, width, x - 1, y - 1);
+            assert_eq!(border, palette.panel_border, "рамка мини-карты пропала");
+
+            // Внутри рамки карта не выходит за ее пределы:
+            // все точки существ лежат в квадрате MINIMAP_SIZE.
+            for cell_x in 0..size {
+                for cell_y in 0..size {
+                    let (dx, dy) = minimap_position(cell_x, cell_y, size);
+                    assert!(
+                        dx < MINIMAP_SIZE as i64 && dy < MINIMAP_SIZE as i64,
+                        "точка мини-карты вылезла за рамку: ({dx}, {dy})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn panel_width_counts_characters_not_bytes() {
+        let lines = ["é"];
+        // Один символ — один глиф, значит ширина текста равна шагу шрифта.
+        assert_eq!(panel_text_width(lines.iter().copied()), TEXT_ADVANCE);
+        assert_eq!(panel_width_of(&lines), TEXT_ADVANCE + PANEL_PADDING * 2);
+    }
+
+    #[test]
+    fn genome_bar_splits_the_cell_fully() {
+        let mut jar = Jar::with_seed(5, 1);
+        jar.creatures[0] = Some(Creature::new(genome_top()));
+        let snapshot = jar.snapshot();
+
+        let mix = snapshot.cells[0].genome_mix.expect("состав генома");
+        let cell = 24u32;
+
+        // Части полоски не могут быть шире клетки.
+        let total: u32 = mix.iter().map(|share| (cell * *share as u32) / 255).sum();
+        assert!(
+            total <= cell,
+            "части полоски не могут быть шире клетки: {total} против {cell}"
+        );
+
+        // Остаток добивается последним цветом, поэтому полоска
+        // занимает клетку целиком.
+        let rest = cell - total;
+        assert_eq!(
+            total + rest,
+            cell,
+            "полоска должна заполнять клетку целиком"
+        );
+    }
+
+    #[test]
+    fn genome_bar_is_not_drawn_on_small_cells() {
+        let snapshot = small_snapshot(5);
+
+        let width = 400u32;
+        let height = 400u32;
+        let mut buffer = vec![0u32; (width * height) as usize];
+        draw_frame(
+            &mut buffer,
+            width,
+            height,
+            &snapshot,
+            ViewMode::Genome,
+            8,
+            (0, 0),
+        );
+
+        let palette = Palette::new();
+        let (offset_x, offset_y) = field_origin(width, height, 5 * 8);
+
+        // Нижний ряд клетки: полоски состава здесь быть не должно,
+        // поэтому остается цвет генома.
+        let genome_color = snapshot.cells[0].genome_color.expect("цвет генома");
+        let pixel = pixel_at(&buffer, width, offset_x + 4, offset_y + 7);
+        assert_eq!(
+            pixel, genome_color,
+            "на мелком масштабе полоска состава не рисуется"
+        );
+
+        // А на крупном масштабе полоска уже есть: цвет внизу клетки
+        // отличается от цвета генома.
+        let mut big_buffer = vec![0u32; (width * height) as usize];
+        draw_frame(
+            &mut big_buffer,
+            width,
+            height,
+            &snapshot,
+            ViewMode::Genome,
+            24,
+            (0, 0),
+        );
+        let (big_x, big_y) = field_origin(width, height, 5 * 24);
+        let bar_pixel = pixel_at(&big_buffer, width, big_x + 4, big_y + 22);
+        assert_ne!(
+            bar_pixel, genome_color,
+            "на крупном масштабе полоска состава рисуется"
+        );
+        assert!(
+            palette.action_colors.contains(&bar_pixel),
+            "полоска должна быть одного из цветов типов генов"
+        );
+    }
+
+    #[test]
+    fn cell_color_handles_degenerate_values() {
+        let mut jar = Jar::with_seed(5, 1);
+        jar.creatures[0] = Some(Creature::new(genome_top()));
+        jar.creatures[0].as_mut().unwrap().energy = 500;
+        let snapshot = jar.snapshot();
+        let palette = Palette::new();
+
+        // Пустое поле: максимум минералов равен нулю, но цвет считается.
+        let empty = Jar::with_seed(5, 1).snapshot();
+        let _ = cell_color(&empty, 0, ViewMode::Minerals, &palette);
+
+        // Энергия больше ста: клетка просто светлее.
+        let color = cell_color(&snapshot, 0, ViewMode::Creatures, &palette);
+        let bright = cell_color(
+            &{
+                let mut jar = Jar::with_seed(5, 1);
+                jar.creatures[0] = Some(Creature::new(genome_top()));
+                jar.creatures[0].as_mut().unwrap().energy = 100;
+                jar.snapshot()
+            },
+            0,
+            ViewMode::Creatures,
+            &palette,
+        );
+        assert_eq!(color, bright, "энергия выше ста не должна менять цвет");
+
+        // Пустая клетка в режиме энергии: цвет фона банки.
+        assert_eq!(
+            cell_color(&snapshot, 1, ViewMode::Energy, &palette),
+            palette.jar_bg
+        );
+    }
+
+    // ----------------------------------------------------------------------
+    // Общие проверки и нагрузочные тесты
+    // ----------------------------------------------------------------------
+
+    #[test]
+    fn trails_settle_on_the_target_color() {
+        // В режимах-тепкарт цвет клетки догоняет новые данные постепенно.
+        let size = 5usize;
+        let mut jar = Jar::with_seed(size, 1);
+        jar.creatures[0] = Some(Creature::new(genome_top()));
+        let snapshot = jar.snapshot();
+
+        let width = 400u32;
+        let height = 400u32;
+        let mut buffer = vec![0u32; (width * height) as usize];
+        let mut cell_layer = vec![Palette::new().jar_bg; size * size];
+
+        let (offset_x, offset_y) = field_origin(width, height, size as u32 * 8);
+
+        // Первый кадр: цвет клетки еще не догнал целевой.
+        draw_frame_with_layer(
+            &mut buffer,
+            width,
+            height,
+            &snapshot,
+            ViewMode::Minerals,
+            8,
+            (0, 0),
+            &mut cell_layer,
+        );
+        let first = pixel_at(&buffer, width, offset_x + 4, offset_y + 4);
+
+        // Через много кадров цвет приходит к целевому.
+        // У этой клетки максимум минералов, значит целевой цвет -
+        // самый темный стоп шкалы.
+        let target = ramp(255, &MINERAL_RAMP);
+        for _ in 0..60 {
+            draw_frame_with_layer(
+                &mut buffer,
+                width,
+                height,
+                &snapshot,
+                ViewMode::Minerals,
+                8,
+                (0, 0),
+                &mut cell_layer,
+            );
+        }
+        let last = pixel_at(&buffer, width, offset_x + 4, offset_y + 4);
+
+        assert_ne!(first, target, "цвет должен сначала догонять");
+        assert_eq!(last, target, "цвет должен в конце прийти к целевому");
+    }
+
+    #[test]
+    fn cell_info_is_built_from_the_snapshot_alone() {
+        let mut jar = Jar::with_seed(10, 5);
+        jar.creatures[0] = Some(Creature::new(genome_of(CreatureAction::EatMinerals)));
+        jar.creatures[0].as_mut().unwrap().energy = 5;
+        jar.simulation_step();
+
+        let snapshot = jar.snapshot();
+
+        let alive = CellInfo::from_snapshot(&snapshot, 0, 0);
+        assert!(alive.alive, "клетка с существом должна быть живой");
+        assert_eq!(alive.energy, 4);
+        assert_eq!(alive.eaten, 1, "инспектор должен видеть съеденные минералы");
+        assert_eq!(alive.age, 1, "инспектор должен видеть возраст");
+        assert!(alive.mix.is_some(), "состав генома должен быть виден");
+
+        let empty = CellInfo::from_snapshot(&snapshot, 1, 0);
+        assert!(!empty.alive, "пустая клетка не должна быть живой");
+        assert_eq!(empty.energy, 0);
+        assert_eq!(empty.eaten, 0);
+        assert_eq!(empty.age, 0);
+        assert!(empty.mix.is_none());
+        assert_eq!(empty.minerals, snapshot.minerals[1]);
+    }
+
+    #[test]
+    fn hud_and_inspector_lines_describe_the_state() {
+        let snapshot = small_snapshot(5);
+        let [top, bottom] = hud_lines(&snapshot, ViewMode::Minerals, "x2", "x2.0", true);
+
+        assert!(top.contains("tick 0"), "строка HUD: {top}");
+        assert!(top.contains("pop 1"), "строка HUD: {top}");
+        assert!(bottom.contains("mode minerals"), "строка HUD: {bottom}");
+        assert!(bottom.contains("speed x2"), "строка HUD: {bottom}");
+        assert!(bottom.contains("PAUSED"), "строка HUD: {bottom}");
+
+        let info = CellInfo::from_snapshot(&snapshot, 0, 0);
+        let lines = inspector_lines(&info);
+        assert_eq!(lines[0], "cell 0,0");
+        assert!(lines[1].contains("energy"), "строки инспектора: {lines:?}");
+
+        let empty = CellInfo::from_snapshot(&snapshot, 1, 0);
+        let lines = inspector_lines(&empty);
+        assert!(lines.contains(&"empty".to_string()), "строки: {lines:?}");
+    }
+
+    #[test]
+    fn anchors_place_panels_in_the_right_corners() {
+        let window = (800u32, 600u32);
+        let size = (100u32, 40u32);
+
+        assert_eq!(Anchor::TopLeft.place(window, size, 6), (6, 6));
+        assert_eq!(Anchor::TopRight.place(window, size, 6), (694, 6));
+        assert_eq!(Anchor::BottomLeft.place(window, size, 6), (6, 554));
+        assert_eq!(Anchor::BottomRight.place(window, size, 6), (694, 554));
+    }
+
+    #[test]
+    fn viewport_reports_only_visible_cells() {
+        // Поле 100 клеток по 8 пикселей в окне 320x320: видно только часть.
+        let viewport = Viewport {
+            offset_x: 0,
+            offset_y: 0,
+            cell: 8,
+            grid: 800,
+            size: 100,
+        };
+
+        let (x0, x1, y0, y1) = viewport.visible_cells(320, 320);
+        assert_eq!(x0, 0);
+        assert_eq!(y0, 0);
+        assert_eq!(x1, 40, "в окно влезает 40 клеток по 8 пикселей");
+        assert_eq!(y1, 40);
+
+        // Если поле сдвинуто, видны клетки с середины.
+        let shifted = Viewport {
+            offset_x: -400,
+            offset_y: 0,
+            cell: 8,
+            grid: 800,
+            size: 100,
+        };
+        let (x0, _, _, _) = shifted.visible_cells(320, 320);
+        assert_eq!(x0, 50, "первая видимая клетка считается от края поля");
+    }
+
+    /// Хеш состояния мира: грубая, но устойчивая к перестановкам сводка.
+    fn state_hash(jar: &Jar) -> u64 {
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+
+        let mut mix = |value: u64| {
+            hash ^= value;
+            hash = hash.wrapping_mul(0x100_0000_01b3);
+        };
+
+        mix(jar.tick as u64);
+        for (index, cell) in jar.creatures.iter().enumerate() {
+            mix(index as u64);
+            match cell {
+                None => mix(0),
+                Some(creature) => {
+                    mix(1);
+                    mix(creature.energy as u64);
+                    mix(creature.minerals as u64);
+                    mix(creature.age as u64);
+                    for action in creature.genome.genes() {
+                        match action {
+                            CreatureAction::Split => mix(1),
+                            CreatureAction::PhotoGrow => mix(2),
+                            CreatureAction::EatMinerals => mix(3),
+                            CreatureAction::Jump(delta) => mix(4 + *delta as u64),
+                        }
+                    }
+                }
+            }
+        }
+        for minerals in &jar.minerals {
+            mix(*minerals as u64);
+        }
+
+        hash
+    }
+
+    #[test]
+    fn fixed_seed_produces_a_known_state() {
+        // Страховочный тест: любое случайное изменение правил симуляции
+        // ломает его. Значение меняется только вместе с правилами -
+        // тогда, когда изменение задумано.
+        let mut jar = Jar::with_seed(30, 0xC0FFEE);
+        spawn(&mut jar, &genome_top(), &[(10, 2), (11, 2), (12, 2)]);
+        spawn(&mut jar, &genome_left(), &[(2, 10)]);
+
+        for _ in 0..200 {
+            jar.simulation_step();
+        }
+
+        assert_eq!(
+            state_hash(&jar),
+            5763222493178675409,
+            "состояние симуляции изменилось: правила ведут себя иначе"
+        );
+    }
+
+    #[test]
+    fn standard_genome_has_16_genes() {
+        assert_eq!(CreatureGenome::standard().len(), 16);
+    }
+
+    #[test]
+    fn genome_line_is_not_reachable_from_outside() {
+        // Гены живут внутри генома: изменить их можно только
+        // через методы, и каждый пересчитывает цвет.
+        let genome = CreatureGenome::standard();
+        assert_eq!(genome.len(), genome.genes().len());
+        assert_eq!(genome.color(), genome_color(&genome));
+    }
+
+    #[test]
+    fn genome_color_is_cached_and_updated_after_mutation() {
+        let genome = CreatureGenome::standard();
+        let before = genome.color();
+
+        let mut changed = genome.clone();
+        changed.apply_mutation(MutationKind::Replace, &mut Rng::new(1));
+        assert_eq!(changed.color(), genome_color(&changed));
+        assert_eq!(
+            changed.color(),
+            compute_genome_color(changed.genes()),
+            "цвет генома должен совпадать с расчетом по нити"
+        );
+        let _ = before;
+    }
+
+    #[test]
+    fn snapshot_into_reuses_buffers_and_gives_the_same_result() {
+        let mut jar = Jar::with_seed(10, 5);
+        spawn(&mut jar, &genome_top(), &[(1, 1), (2, 2)]);
+        jar.simulation_step();
+
+        let fresh = jar.snapshot();
+
+        // Тот же снимок, но через переиспользование буферов.
+        let mut reused = JarSnapshot::new(10);
+        jar.snapshot_into(&mut reused);
+        jar.simulation_step();
+        jar.snapshot_into(&mut reused);
+
+        let again = jar.snapshot();
+        assert_eq!(again.cells.len(), reused.cells.len());
+        assert_eq!(again.population, reused.population);
+        assert_eq!(again.minerals, reused.minerals);
+        for (left, right) in again.cells.iter().zip(reused.cells.iter()) {
+            assert_eq!(left.alive, right.alive);
+            assert_eq!(left.energy, right.energy);
+            assert_eq!(left.eaten, right.eaten);
+            assert_eq!(left.age, right.age);
+        }
+        let _ = fresh;
+    }
+
+    #[test]
+    fn snapshot_carries_eaten_minerals_and_age() {
+        let mut jar = Jar::with_seed(10, 5);
+        jar.creatures[0] = Some(Creature::new(genome_of(CreatureAction::EatMinerals)));
+        jar.creatures[0].as_mut().unwrap().energy = 5;
+
+        jar.simulation_step();
+
+        let snapshot = jar.snapshot();
+        assert_eq!(
+            snapshot.cells[0].eaten, 1,
+            "снимок должен помнить съеденные минералы"
+        );
+        assert_eq!(snapshot.cells[0].age, 1, "снимок должен помнить возраст");
+        assert_eq!(snapshot.cells[1].eaten, 0);
+    }
+
+    #[test]
+    fn jar_with_seed_is_reproducible() {
+        let first = Jar::with_seed(10, 77);
+        let second = Jar::with_seed(10, 77);
+
+        assert_eq!(first.size, second.size);
+        assert_eq!(first.config.lifetime_ticks, second.config.lifetime_ticks);
+        assert_eq!(first.minerals, second.minerals);
     }
 
     #[test]
@@ -2499,7 +5428,7 @@ mod tests {
     #[test]
     fn spawn_places_creatures_at_positions() {
         let mut jar = Jar::new(20);
-        spawn(&mut jar, genome_top(), &[(9, 2), (10, 2), (11, 2)]);
+        spawn(&mut jar, &genome_top(), &[(9, 2), (10, 2), (11, 2)]);
 
         for (x, y) in [(9, 2), (10, 2), (11, 2)] {
             assert!(jar.creatures[x + y * jar.size].is_some());
@@ -2519,6 +5448,37 @@ mod tests {
 
         let alive = jar.creatures.iter().filter(|cell| cell.is_some()).count();
         assert!(alive > initial, "популяция вымерла: {alive} <= {initial}");
+    }
+
+    #[test]
+    fn all_four_colonies_survive() {
+        let mut jar = seeded_jar();
+        jar.rng = Rng::new(0xC0FFEE);
+
+        // Начальные места четырех колоний.
+        let colonies = [
+            ("верх", 50usize, 2usize),
+            ("право", 97, 50),
+            ("низ", 50, 97),
+            ("лево", 2, 50),
+        ];
+
+        for _ in 0..300 {
+            jar.simulation_step();
+        }
+
+        // Колония жива, если в ее регионе есть клетки:
+        // конкретная клетка может умереть от старости или задохнуться
+        // в тупике, но колония продолжит жизнь в соседях.
+        for (name, x, y) in colonies {
+            let alive = (0..jar.size)
+                .flat_map(|row| (0..jar.size).map(move |col| (col, row)))
+                .filter(|(col, row)| col.abs_diff(x) <= 6 && row.abs_diff(y) <= 6)
+                .filter(|(col, row)| jar.creatures[col + row * jar.size].is_some())
+                .count();
+
+            assert!(alive > 0, "колония {name} вымерла");
+        }
     }
 
     #[test]
@@ -2544,7 +5504,7 @@ mod tests {
 
         for _ in 0..1000 {
             genome.mutate(&mut rng);
-            assert!(!genome.line.is_empty());
+            assert!(!genome.is_empty());
         }
     }
 
@@ -2554,23 +5514,23 @@ mod tests {
         let mut genome = CreatureGenome::from_line(vec![CreatureAction::Jump(5)]);
 
         assert!(genome.mutate_jump_value(&mut rng));
-        assert_ne!(genome.line[0], CreatureAction::Jump(5));
+        assert_ne!(genome.genes()[0], CreatureAction::Jump(5));
     }
 
     #[test]
     fn mutations_eventually_change_genome() {
         let mut rng = Rng::new(99);
         let mut genome = CreatureGenome::standard();
-        let original = genome.clone();
+        let original = genome.genes().to_vec();
 
         for _ in 0..100 {
             genome.mutate(&mut rng);
-            if genome.line != original.line {
+            if genome.genes() != original.as_slice() {
                 break;
             }
         }
 
-        assert_ne!(genome.line, original.line);
+        assert_ne!(genome.genes(), original.as_slice());
     }
 
     #[test]
@@ -2647,15 +5607,18 @@ mod tests {
 
     #[test]
     fn mutation_changes_genome_mix() {
-        let mut genome = CreatureGenome::standard();
+        let genome = CreatureGenome::standard();
         let before = genome_mix(&genome);
 
-        genome.line[0] = CreatureAction::Jump(1);
-        let after = genome_mix(&genome);
+        let mutated = genome.with_genes(&[(0, CreatureAction::Jump(1))]);
+        let after = genome_mix(&mutated);
 
         assert_ne!(before, after, "мутация не изменила состав генома");
         assert_eq!(after.iter().map(|share| *share as u32).sum::<u32>(), 255);
-        assert!(after[3] > before[3], "доля прыжков не выросла");
+        assert!(
+            after[ActionKind::Jump.index()] > before[ActionKind::Jump.index()],
+            "доля прыжков не выросла"
+        );
     }
 
     #[test]
@@ -2726,9 +5689,8 @@ mod tests {
 
     #[test]
     fn snapshot_reports_population_and_extremes() {
-        let mut jar = Jar::new(20);
-        jar.rng = Rng::new(0xC0FFEE);
-        spawn(&mut jar, genome_top(), &[(9, 2), (10, 2), (11, 2)]);
+        let mut jar = Jar::with_seed(20, 0xC0FFEE);
+        spawn(&mut jar, &genome_top(), &[(9, 2), (10, 2), (11, 2)]);
 
         let snapshot = jar.snapshot();
         assert_eq!(snapshot.population, 3);
@@ -2741,7 +5703,7 @@ mod tests {
         }
         let snapshot = jar.snapshot();
         assert!(
-            snapshot.actions.iter().any(Option::is_some),
+            snapshot.cells.iter().any(|cell| cell.action.is_some()),
             "после тиков не записано ни одного действия"
         );
     }
@@ -2757,17 +5719,17 @@ mod tests {
     #[test]
     fn selection_exists_only_when_the_field_does_not_fit() {
         let mut app = App::new(Jar::new(20));
-        app.window_size = (800, 800);
+        app.camera.set_window_size(800, 800);
 
-        app.cell_size = 8;
+        app.camera.set_cell_size(8);
         assert!(
-            !app.selection_active(),
+            !app.camera.selection_active(),
             "поле помещается, выделения быть не должно"
         );
 
-        app.cell_size = 64;
+        app.camera.set_cell_size(64);
         assert!(
-            app.selection_active(),
+            app.camera.selection_active(),
             "поле не помещается, выделение нужно"
         );
     }
@@ -2775,65 +5737,47 @@ mod tests {
     #[test]
     fn selection_moves_by_exactly_one_cell() {
         let mut app = App::new(Jar::new(20));
-        app.window_size = (800, 800);
-        app.cell_size = 64;
-        app.cursor_x = 10;
-        app.cursor_y = 10;
+        app.camera.set_window_size(800, 800);
+        app.camera.set_cell_size(64);
+        app.camera.cursor_x = 10;
+        app.camera.cursor_y = 10;
 
-        app.move_selection(Direction::Right);
-        assert_eq!((app.cursor_x, app.cursor_y), (11, 10));
+        app.camera.move_selection(Direction::Right);
+        assert_eq!((app.camera.cursor_x, app.camera.cursor_y), (11, 10));
 
-        app.move_selection(Direction::Up);
-        assert_eq!((app.cursor_x, app.cursor_y), (11, 9));
+        app.camera.move_selection(Direction::Up);
+        assert_eq!((app.camera.cursor_x, app.camera.cursor_y), (11, 9));
     }
 
     #[test]
     fn selection_does_not_move_when_the_field_fits() {
         let mut app = App::new(Jar::new(20));
-        app.window_size = (800, 800);
-        app.cell_size = 8;
-        app.cursor_x = 10;
-        app.cursor_y = 10;
+        app.camera.set_window_size(800, 800);
+        app.camera.set_cell_size(8);
+        app.camera.cursor_x = 10;
+        app.camera.cursor_y = 10;
 
-        app.move_selection(Direction::Right);
-        assert_eq!((app.cursor_x, app.cursor_y), (10, 10));
+        app.camera.move_selection(Direction::Right);
+        assert_eq!((app.camera.cursor_x, app.camera.cursor_y), (10, 10));
     }
 
     #[test]
     fn selection_stops_at_the_field_border() {
         let mut app = App::new(Jar::new(20));
-        app.window_size = (800, 800);
-        app.cell_size = 64;
+        app.camera.set_window_size(800, 800);
+        app.camera.set_cell_size(64);
 
-        app.cursor_x = 0;
-        app.cursor_y = 0;
-        app.move_selection(Direction::Left);
-        app.move_selection(Direction::Up);
-        assert_eq!((app.cursor_x, app.cursor_y), (0, 0));
+        app.camera.cursor_x = 0;
+        app.camera.cursor_y = 0;
+        app.camera.move_selection(Direction::Left);
+        app.camera.move_selection(Direction::Up);
+        assert_eq!((app.camera.cursor_x, app.camera.cursor_y), (0, 0));
 
-        app.cursor_x = 19;
-        app.cursor_y = 19;
-        app.move_selection(Direction::Right);
-        app.move_selection(Direction::Down);
-        assert_eq!((app.cursor_x, app.cursor_y), (19, 19));
-    }
-
-    #[test]
-    fn zoom_in_creates_selection_in_the_center_of_the_view() {
-        let mut app = App::new(Jar::new(20));
-        app.window_size = (800, 800);
-        app.cell_size = 8;
-        app.fit_cell_size = 8;
-        assert!(!app.selection_active());
-
-        app.set_cell_size(64);
-
-        assert!(app.selection_active());
-        assert_eq!(
-            (app.cursor_x, app.cursor_y),
-            (10, 10),
-            "выделение должно появиться в центре вида"
-        );
+        app.camera.cursor_x = 19;
+        app.camera.cursor_y = 19;
+        app.camera.move_selection(Direction::Right);
+        app.camera.move_selection(Direction::Down);
+        assert_eq!((app.camera.cursor_x, app.camera.cursor_y), (19, 19));
     }
 
     #[test]
@@ -2848,71 +5792,30 @@ mod tests {
         assert_eq!(fastest, REPEAT_INTERVAL_MIN);
     }
 
+    /// Нагрузочная проверка: много зерон, много тиков, инварианты целы.
     #[test]
-    fn press_moves_once_and_repeat_takes_over_later() {
-        let mut app = App::new(Jar::new(20));
-        app.window_size = (800, 800);
-        app.cell_size = 64;
-        app.cursor_x = 10;
+    fn many_seeds_survive_many_ticks() {
+        for seed in 0..50u64 {
+            let config = Config {
+                lifetime_ticks: 200,
+                ..Config::default()
+            };
+            let mut jar = Jar::with_config_and_seed(30, config, seed * 104_729 + 3);
+            spawn(&mut jar, &genome_top(), &[(10, 2), (11, 2)]);
+            spawn(&mut jar, &genome_left(), &[(2, 10)]);
 
-        let now = Instant::now();
-        app.press_direction(Direction::Right);
-        assert_eq!(app.cursor_x, 11, "нажатие должно сдвинуть на одну клетку");
-        assert!(app.hold.is_some());
+            let minerals = total_minerals(&jar);
 
-        // До истечения задержки автоповтора ничего не происходит.
-        app.update_repeat(now);
-        assert_eq!(app.cursor_x, 11);
+            for _ in 0..2000 {
+                jar.simulation_step();
+            }
 
-        // После задержки выделение едет само.
-        app.update_repeat(now + REPEAT_DELAY + Duration::from_millis(1));
-        assert_eq!(app.cursor_x, 12);
-
-        app.release_direction();
-        assert!(app.hold.is_none());
-    }
-
-    #[test]
-    fn direction_is_recognized_by_key() {
-        assert_eq!(
-            Direction::from_key(PhysicalKey::Code(KeyCode::KeyW)),
-            Some(Direction::Up)
-        );
-        assert_eq!(
-            Direction::from_key(PhysicalKey::Code(KeyCode::ArrowRight)),
-            Some(Direction::Right)
-        );
-        assert_eq!(Direction::from_key(PhysicalKey::Code(KeyCode::Space)), None);
-    }
-
-    #[test]
-    fn flash_marks_cells_that_changed() {
-        let mut jar = Jar::new(20);
-        jar.rng = Rng::new(0xC0FFEE);
-
-        let mut app = App::new(jar);
-        app.update_flashes();
-        assert!(
-            app.flashes.iter().all(|flash| *flash == 0),
-            "вспышки появились без изменений"
-        );
-
-        // Появилась новая клетка — на её месте вспышка.
-        let index = 9 + 2 * 20;
-        app.jar.creatures[index] = Some(Creature {
-            genome: genome_top(),
-            energy: 0,
-            minerals: 0,
-            age: 0,
-            last_action: None,
-        });
-        app.snapshot = app.jar.snapshot();
-        app.update_flashes();
-
-        assert!(app.flashes[index] > 0, "рождение клетки не вызвало вспышку");
-        assert!(
-            app.flashes[8 + 2 * 20] == 0,
-            "вспышка появилась на пустой клетке"
-        );
+            assert_invariants(&jar, &config);
+            assert_eq!(
+                minerals,
+                total_minerals(&jar),
+                "минералы разошлись на зерне {seed}"
+            );
+        }
     }
 }

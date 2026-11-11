@@ -19,7 +19,7 @@ fn describe(name: &str, genome: &CreatureGenome) {
     let b = color & 0xFF;
     println!(
         "{name:>6}: #{r:02X}{g:02X}{b:02X}  (r={r:>3} g={g:>3} b={b:>3})  генов: {}",
-        genome.line.len()
+        genome.len()
     );
 }
 
@@ -46,9 +46,8 @@ fn main() {
     println!("=== чувствительность к мутации (стандартный геном + 1 замена) ===");
     let base = genome_top();
     let base_color = genome_color(&base);
-    for index in 0..base.line.len() {
-        let mut mutated = base.clone();
-        mutated.line[index] = CreatureAction::Jump(1);
+    for index in 0..base.len() {
+        let mutated = base.clone().with_genes(&[(index, CreatureAction::Jump(1))]);
         let color = genome_color(&mutated);
         let delta = color_diff(base_color, color);
         println!("замена гена {index:>2}: #{color:06X}  отличие от исходного: {delta}");
