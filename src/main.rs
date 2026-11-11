@@ -60,8 +60,16 @@ const SPLIT_ENERGY: usize = 100;
 const SPLIT_MINERALS: usize = 10;
 /// Сколько процентов энергии матери достается каждому ребенку.
 const SPLIT_ENERGY_SHARE_PERCENT: usize = 40;
-/// Сколько минералов изначально лежит в каждой клетке поля.
-const INITIAL_MINERALS: usize = 100;
+/// Сколько месторождений минералов создается на поле.
+const MINERAL_DEPOSITS: usize = 16;
+/// Минимальный радиус месторождения в клетках.
+const MINERAL_DEPOSIT_RADIUS_MIN: usize = 5;
+/// Максимальный радиус месторождения в клетках.
+const MINERAL_DEPOSIT_RADIUS_MAX: usize = 11;
+/// Сколько минералов лежит в центре месторождения.
+const MINERAL_DEPOSIT_RICHNESS: usize = 160;
+/// Сколько минералов лежит вдали от месторождений.
+const MINERAL_BACKGROUND: usize = 10;
 /// Сколько энергии клетка отдает случайному соседу за один ген Share.
 const SHARE_AMOUNT: usize = 8;
 /// Сколько энергии стоит одна атака.
@@ -599,8 +607,16 @@ pub struct Config {
     pub split_minerals: usize,
     /// Сколько процентов энергии матери достается каждому ребенку.
     pub split_energy_share_percent: usize,
-    /// Сколько минералов изначально лежит в каждой клетке поля.
-    pub initial_minerals: usize,
+    /// Сколько минералов лежит в центре месторождения.
+    pub mineral_deposit_richness: usize,
+    /// Сколько минералов лежит вдали от месторождений.
+    pub mineral_background: usize,
+    /// Сколько месторождений создается на поле.
+    pub mineral_deposits: usize,
+    /// Минимальный радиус месторождения в клетках.
+    pub mineral_deposit_radius_min: usize,
+    /// Максимальный радиус месторождения в клетках.
+    pub mineral_deposit_radius_max: usize,
     /// Сколько генов в стандартном геноме.
     pub genome_len: usize,
 }
@@ -616,10 +632,69 @@ impl Default for Config {
             split_energy: SPLIT_ENERGY,
             split_minerals: SPLIT_MINERALS,
             split_energy_share_percent: SPLIT_ENERGY_SHARE_PERCENT,
-            initial_minerals: INITIAL_MINERALS,
+            mineral_deposit_richness: MINERAL_DEPOSIT_RICHNESS,
+            mineral_background: MINERAL_BACKGROUND,
+            mineral_deposits: MINERAL_DEPOSITS,
+            mineral_deposit_radius_min: MINERAL_DEPOSIT_RADIUS_MIN,
+            mineral_deposit_radius_max: MINERAL_DEPOSIT_RADIUS_MAX,
             genome_len: GENOME_LEN,
         }
     }
+}
+
+/// Создает слой минералов с месторождениями.
+///
+/// Поле начинается как скудный фон `mineral_background`: его хватает
+/// на редкие деления, но не на сытую жизнь. Поверх фона раскладываются
+/// круглые залежи: в центре каждой лежит `mineral_deposit_richness`,
+/// а к краю запас плавно падает до фона. Между залежами остаются
+/// бедные области, за которые колониям приходится конкурировать.
+///
+/// Если залежи перекрываются, берется максимум, а не сумма: иначе
+/// на пересечениях появлялись бы пики, которых нет в настройках.
+fn generate_mineral_field(size: usize, config: &Config, rng: &mut Rng) -> Vec<usize> {
+    let background = config.mineral_background;
+    let mut field = vec![background; size * size];
+
+    if size == 0 || config.mineral_deposits == 0 {
+        return field;
+    }
+
+    let richness = config.mineral_deposit_richness.max(background);
+    let excess = richness - background;
+    let radius_min = config.mineral_deposit_radius_min.max(1);
+    let radius_max = config.mineral_deposit_radius_max.max(radius_min);
+    let last = size - 1;
+
+    for _ in 0..config.mineral_deposits {
+        let center_x = rng.below(size);
+        let center_y = rng.below(size);
+        let radius = radius_min + rng.below(radius_max - radius_min + 1);
+        let radius_squared = radius * radius;
+
+        let from_x = center_x.saturating_sub(radius);
+        let to_x = center_x.saturating_add(radius).min(last);
+        let from_y = center_y.saturating_sub(radius);
+        let to_y = center_y.saturating_add(radius).min(last);
+
+        for y in from_y..=to_y {
+            for x in from_x..=to_x {
+                let dx = x.abs_diff(center_x);
+                let dy = y.abs_diff(center_y);
+                let distance_squared = dx * dx + dy * dy;
+                if distance_squared > radius_squared {
+                    continue;
+                }
+
+                // В центре залежь полная, к границе запас падает до фона.
+                let fill = (radius_squared - distance_squared) * excess / radius_squared;
+                let index = x + y * size;
+                field[index] = field[index].max(background + fill);
+            }
+        }
+    }
+
+    field
 }
 
 /// Случайный срок жизни клетки: от нижней до верхней границы из настроек.
@@ -989,9 +1064,9 @@ impl Jar {
     }
 
     /// Собирает банку нужного размера.
-    fn build(size: usize, config: Config, rng: Rng) -> Self {
+    fn build(size: usize, config: Config, mut rng: Rng) -> Self {
         let creatures = vec![None; size * size];
-        let minerals = vec![config.initial_minerals; size * size];
+        let minerals = generate_mineral_field(size, &config, &mut rng);
 
         Self {
             size,
@@ -3962,6 +4037,70 @@ mod tests {
     }
 
     #[test]
+    fn mineral_field_has_rich_deposits_and_poor_background() {
+        let config = Config::default();
+        let size = 100;
+        let mut rng = Rng::new(0xDEAD_BEEF);
+        let field = generate_mineral_field(size, &config, &mut rng);
+
+        assert_eq!(field.len(), size * size);
+        assert_eq!(
+            *field.iter().max().unwrap(),
+            config.mineral_deposit_richness,
+            "в центре месторождения должен быть полный запас"
+        );
+        assert_eq!(
+            *field.iter().min().unwrap(),
+            config.mineral_background,
+            "между месторождениями должен оставаться скудный фон"
+        );
+
+        let poor = field
+            .iter()
+            .filter(|&&amount| amount == config.mineral_background)
+            .count();
+        let rich = field
+            .iter()
+            .filter(|&&amount| amount > config.mineral_background * 2)
+            .count();
+
+        assert!(
+            poor > size * size / 2,
+            "больше половины поля должно быть бедным: {poor}"
+        );
+        assert!(rich > 0, "должны быть по-настоящему богатые клетки");
+        assert!(
+            rich < size * size,
+            "богатыми не может быть все поле целиком"
+        );
+    }
+
+    #[test]
+    fn mineral_field_without_deposits_is_uniform_background() {
+        let config = Config {
+            mineral_deposits: 0,
+            ..Config::default()
+        };
+        let field = generate_mineral_field(20, &config, &mut Rng::new(5));
+
+        assert!(
+            field
+                .iter()
+                .all(|&amount| amount == config.mineral_background),
+            "без месторождений поле должно быть ровным"
+        );
+    }
+
+    #[test]
+    fn mineral_field_depends_on_the_seed() {
+        let config = Config::default();
+        let first = generate_mineral_field(60, &config, &mut Rng::new(1));
+        let second = generate_mineral_field(60, &config, &mut Rng::new(2));
+
+        assert_ne!(first, second, "разные зерна должны давать разные залежи");
+    }
+
+    #[test]
     fn energy_never_goes_negative() {
         let mut jar = Jar::with_seed(20, 99);
         spawn(&mut jar, &genome_bottom(), &[(5, 5), (6, 5)]);
@@ -4132,20 +4271,22 @@ mod tests {
     fn eating_needs_energy_and_minerals() {
         // Без энергии поесть нельзя.
         let mut jar = jar_with(genome_of(CreatureAction::EatMinerals), 10);
+        let before = jar.minerals[0];
         jar.simulation_step();
         let creature = jar.creatures[0].as_ref().unwrap();
         assert_eq!(creature.energy, 0);
         assert_eq!(creature.minerals, 0);
-        assert_eq!(jar.minerals[0], 100, "минералы в поле не тронуты");
+        assert_eq!(jar.minerals[0], before, "минералы в поле не тронуты");
 
         // С энергией поесть можно: минерал переезжает в существо.
         let mut jar = jar_with(genome_of(CreatureAction::EatMinerals), 10);
+        let before = jar.minerals[0];
         jar.creatures[0].as_mut().unwrap().energy = 5;
         jar.simulation_step();
         let creature = jar.creatures[0].as_ref().unwrap();
         assert_eq!(creature.energy, 4, "еда стоит один энергии");
         assert_eq!(creature.minerals, 1, "минерал должен попасть в существо");
-        assert_eq!(jar.minerals[0], 99, "в поле минералов стало меньше");
+        assert_eq!(jar.minerals[0], before - 1, "в поле минералов стало меньше");
     }
 
     #[test]
@@ -4603,8 +4744,16 @@ mod tests {
         let attacker = jar.creatures[left].as_ref().unwrap();
         let victim = jar.creatures[right].as_ref().unwrap();
 
-        assert_eq!(attacker.energy, 100 - ATTACK_COST, "атака стоила не столько, сколько должна");
-        assert_eq!(victim.energy, 100 - ATTACK_DAMAGE, "жертва потеряла не столько, сколько должна");
+        assert_eq!(
+            attacker.energy,
+            100 - ATTACK_COST,
+            "атака стоила не столько, сколько должна"
+        );
+        assert_eq!(
+            victim.energy,
+            100 - ATTACK_DAMAGE,
+            "жертва потеряла не столько, сколько должна"
+        );
         assert!(
             ATTACK_DAMAGE > ATTACK_COST,
             "урон должен быть больше цены атаки, иначе война не истощает"
@@ -4626,7 +4775,10 @@ mod tests {
         let minerals_before = jar.minerals[right];
         jar.simulation_step();
 
-        assert!(jar.creatures[right].is_none(), "жертва выжила после смертельного удара");
+        assert!(
+            jar.creatures[right].is_none(),
+            "жертва выжила после смертельного удара"
+        );
         assert_eq!(
             jar.minerals[right],
             minerals_before + 7,
@@ -4682,7 +4834,8 @@ mod tests {
         ]);
 
         // Сосед с другой ДНК - чужой, поэтому указатель смещается.
-        let (mut with_foe, _, _) = jar_with_pair(genome.clone(), genome_of(CreatureAction::Jump(1)));
+        let (mut with_foe, _, _) =
+            jar_with_pair(genome.clone(), genome_of(CreatureAction::Jump(1)));
         with_foe.simulation_step();
         assert_eq!(
             with_foe.creatures[40].as_ref().unwrap().genome.line_pointer,
@@ -4777,7 +4930,8 @@ mod tests {
 
     #[test]
     fn war_starts_between_different_genomes() {
-        let (mut jar, left, right) = jar_with_pair(warrior_genome(), genome_of(CreatureAction::Jump(1)));
+        let (mut jar, left, right) =
+            jar_with_pair(warrior_genome(), genome_of(CreatureAction::Jump(1)));
 
         jar.creatures[left].as_mut().unwrap().energy = 100;
         jar.creatures[right].as_mut().unwrap().energy = 100;
@@ -4795,8 +4949,16 @@ mod tests {
 
         let attacker = jar.creatures[left].as_ref().unwrap();
         let victim = jar.creatures[right].as_ref().unwrap();
-        assert_eq!(attacker.energy, 100 - ATTACK_COST, "воин не заплатил за удар");
-        assert_eq!(victim.energy, 100 - ATTACK_DAMAGE, "чужая клетка не пострадала");
+        assert_eq!(
+            attacker.energy,
+            100 - ATTACK_COST,
+            "воин не заплатил за удар"
+        );
+        assert_eq!(
+            victim.energy,
+            100 - ATTACK_DAMAGE,
+            "чужая клетка не пострадала"
+        );
     }
 
     #[test]
@@ -5900,6 +6062,8 @@ mod tests {
         let size = 5usize;
         let mut jar = Jar::with_seed(size, 1);
         jar.creatures[0] = Some(Creature::new(genome_top()));
+        // Тест проверяет анимацию, а не залежи: ставим максимум явно.
+        jar.minerals[0] = jar.config.mineral_deposit_richness;
         let snapshot = jar.snapshot();
 
         let width = 400u32;
@@ -6087,7 +6251,7 @@ mod tests {
 
         assert_eq!(
             state_hash(&jar),
-            7395578395058024994,
+            12910182316529093844,
             "состояние симуляции изменилось: правила ведут себя иначе"
         );
     }
@@ -6242,9 +6406,7 @@ mod tests {
                 .creatures
                 .iter()
                 .flatten()
-                .filter(|creature| {
-                    creature.genome.similarity_to(&genome) >= KIN_SIMILARITY_PERCENT
-                })
+                .filter(|creature| creature.genome.similarity_to(&genome) >= KIN_SIMILARITY_PERCENT)
                 .count();
 
             assert!(alive > 0, "колония {name} вымерла");
@@ -6267,7 +6429,11 @@ mod tests {
                 .collect()
         };
 
-        assert_eq!(positions(&first).len(), 12, "стартовых клеток должно быть двенадцать");
+        assert_eq!(
+            positions(&first).len(),
+            12,
+            "стартовых клеток должно быть двенадцать"
+        );
         assert_ne!(
             positions(&first),
             positions(&second),
@@ -6489,7 +6655,10 @@ mod tests {
         let snapshot = jar.snapshot();
         assert_eq!(snapshot.population, 3);
         assert_eq!(snapshot.max_energy, 0);
-        assert!(snapshot.max_minerals >= 100);
+        assert!(
+            snapshot.max_minerals >= jar.config.mineral_deposit_richness,
+            "в снимке должно быть видно богатое месторождение"
+        );
 
         // Клетки выполняют действия: в снимке появляется последнее действие.
         for _ in 0..4 {
